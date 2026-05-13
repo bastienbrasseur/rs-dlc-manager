@@ -6,18 +6,24 @@ paths) is import-safe without Qt — Qt symbols are only imported in this module
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
 from typing import Any
 
 import qdarktheme
+from collections.abc import Sequence
+
 from PySide6.QtCore import (
-    QAbstractItemModel, QAbstractTableModel, QModelIndex, QObject,
+    QAbstractItemModel, QAbstractTableModel, QMimeData, QModelIndex, QObject,
     QPersistentModelIndex, QPoint, QRunnable, QSettings, QSize,
     QSortFilterProxyModel, Qt, QThreadPool, Signal,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPixmap
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent,
+    QFont, QIcon, QKeySequence, QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QDockWidget,
     QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
@@ -47,6 +53,7 @@ _COL_FAVORITE = 7
 
 
 _THUMB_SIZE = 40  # px
+_MIME_PSARC_PATHS = "application/x-rsdlc-paths"
 
 
 class DlcTableModel(QAbstractTableModel):
@@ -205,6 +212,33 @@ class DlcTableModel(QAbstractTableModel):
             return 0
         return len(_COLUMNS)
 
+    def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:
+        base = super().flags(index)
+        if index.isValid():
+            return base | Qt.ItemFlag.ItemIsDragEnabled
+        return base
+
+    def supportedDragActions(self) -> Qt.DropAction:
+        return Qt.DropAction.CopyAction
+
+    def mimeTypes(self) -> list[str]:
+        return [_MIME_PSARC_PATHS]
+
+    def mimeData(self, indexes: Sequence[QModelIndex]) -> QMimeData:
+        seen: set[Path] = set()
+        out: list[str] = []
+        for idx in indexes:
+            if not idx.isValid():
+                continue
+            e = self._rows[idx.row()]
+            if e.path in seen:
+                continue
+            seen.add(e.path)
+            out.append(str(e.path))
+        md = QMimeData()
+        md.setData(_MIME_PSARC_PATHS, json.dumps(out).encode("utf-8"))
+        return md
+
     def headerData(self, section: int, orientation: Qt.Orientation,
                    role: int = Qt.ItemDataRole.DisplayRole) -> Any:
         if role != Qt.ItemDataRole.DisplayRole:
@@ -327,6 +361,58 @@ class DlcFilterProxy(QSortFilterProxyModel):
 # ---------------------------------------------------------------------------
 # Scan worker
 # ---------------------------------------------------------------------------
+
+class SetlistDropList(QListWidget):
+    """QListWidget that accepts drops carrying our custom MIME type."""
+
+    pathsDropped = Signal(str, object)  # setlist_name, list[Path]
+    pathsDroppedToNew = Signal(object)  # list[Path]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasFormat(_MIME_PSARC_PATHS):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if event.mimeData().hasFormat(_MIME_PSARC_PATHS):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        md = event.mimeData()
+        if not md.hasFormat(_MIME_PSARC_PATHS):
+            super().dropEvent(event)
+            return
+        try:
+            raw = bytes(md.data(_MIME_PSARC_PATHS).data())
+            paths_raw = json.loads(raw.decode("utf-8"))
+            if not isinstance(paths_raw, list):
+                event.ignore()
+                return
+            paths = [Path(p) for p in paths_raw if isinstance(p, str)]
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            event.ignore()
+            return
+        if not paths:
+            event.ignore()
+            return
+        target_item = self.itemAt(event.position().toPoint())
+        if target_item is None:
+            self.pathsDroppedToNew.emit(paths)
+        else:
+            name = target_item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(name, str):
+                self.pathsDropped.emit(name, paths)
+        event.acceptProposedAction()
+
 
 class _ThumbSignals(QObject):
     ready = Signal(int, object)   # gen, Path
@@ -506,6 +592,8 @@ class MainWindow(QMainWindow):
         self.table.setColumnWidth(3, 200)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+        self.table.setDragEnabled(True)
+        self.table.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         outer.addWidget(self.table)
 
         self.setCentralWidget(central)
@@ -801,6 +889,29 @@ class MainWindow(QMainWindow):
             f"{added} chanson(s) ajoutée(s) à '{name}'", 3000,
         )
 
+    def _on_paths_dropped(self, name: str, paths: list[Path]) -> None:
+        try:
+            added = self._setlists.add_paths(name, paths)
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 4000)
+            return
+        self._setlists.save()
+        self.status.showMessage(
+            f"{added} chanson(s) ajoutée(s) à '{name}'", 3000,
+        )
+
+    def _on_paths_dropped_new(self, paths: list[Path]) -> None:
+        name, ok = QInputDialog.getText(self, "Nouvelle setlist", "Nom :")
+        if not ok or not name.strip():
+            return
+        try:
+            self._setlists.create(name.strip())
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 4000)
+            return
+        self._on_paths_dropped(name.strip(), paths)
+        self._refresh_setlist_list()
+
     def _add_to_new_setlist(self) -> None:
         name, ok = QInputDialog.getText(self, "Nouvelle setlist", "Nom :")
         if not ok or not name.strip():
@@ -900,10 +1011,12 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(container)
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(8)
-        self.setlist_list = QListWidget()
+        self.setlist_list = SetlistDropList()
         self.setlist_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.setlist_list.customContextMenuRequested.connect(self._on_setlist_context_menu)
         self.setlist_list.itemSelectionChanged.connect(self._refresh_setlist_buttons)
+        self.setlist_list.pathsDropped.connect(self._on_paths_dropped)
+        self.setlist_list.pathsDroppedToNew.connect(self._on_paths_dropped_new)
         v.addWidget(self.setlist_list, 1)
         row = QHBoxLayout()
         row.setSpacing(6)
