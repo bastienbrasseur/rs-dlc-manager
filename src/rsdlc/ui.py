@@ -17,13 +17,14 @@ from PySide6.QtCore import (
     QPersistentModelIndex, QPoint, QRunnable, QSettings, QSize,
     QSortFilterProxyModel, Qt, QThreadPool, Signal,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
     QMessageBox, QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
 )
 
+from rsdlc.albumart import build_thumbnail, cache_path_for
 from rsdlc.duplicates import duplicate_keys, is_duplicate
 from rsdlc.icons import icon
 from rsdlc.library import DlcEntry, Library
@@ -41,12 +42,17 @@ _COLUMNS: tuple[str, ...] = (
 )
 
 
+_THUMB_SIZE = 40  # px
+
+
 class DlcTableModel(QAbstractTableModel):
     """Adapts a list of :class:`DlcEntry` for QTableView."""
 
     def __init__(self) -> None:
         super().__init__()
         self._rows: list[DlcEntry] = []
+        self._thumb_cache_dir: Path | None = None
+        self._thumb_qicon_cache: dict[Path, QIcon] = {}
 
     # ---- rows ----
     def set_rows(self, entries: list[DlcEntry]) -> None:
@@ -101,6 +107,36 @@ class DlcTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._rows = [e for e in self._rows if e.path.resolve() not in targets]
         self.endResetModel()
+
+    # ---- thumbnails ----
+
+    def set_thumbnail_cache_dir(self, cache_dir: Path) -> None:
+        self._thumb_cache_dir = cache_dir
+        self._thumb_qicon_cache.clear()
+
+    def notify_thumbnail_ready(self, psarc_path: Path) -> None:
+        """Drop the QIcon cache for this path and trigger a repaint of its rows."""
+        self._thumb_qicon_cache.pop(psarc_path, None)
+        for row, e in enumerate(self._rows):
+            if e.path == psarc_path:
+                idx = self.index(row, 0)
+                self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+
+    def _thumbnail_icon(self, psarc_path: Path) -> QIcon | None:
+        if self._thumb_cache_dir is None:
+            return None
+        cached = self._thumb_qicon_cache.get(psarc_path)
+        if cached is not None:
+            return cached
+        png_path = cache_path_for(psarc_path, self._thumb_cache_dir)
+        if not png_path.is_file():
+            return None
+        pix = QPixmap(str(png_path))
+        if pix.isNull():
+            return None
+        ic = QIcon(pix)
+        self._thumb_qicon_cache[psarc_path] = ic
+        return ic
 
     def replace_paths_batch(self, updates: list[tuple[Path, Path, bool]]) -> None:
         """Apply many ``(old_path, new_path, enabled)`` swaps with one dataChanged."""
@@ -160,6 +196,8 @@ class DlcTableModel(QAbstractTableModel):
             if col == 4: return e.arrangement_label
             if col == 5: return e.tuning_label
             if col == 6: return "● actif" if e.enabled else "○ désactivé"
+        if role == Qt.ItemDataRole.DecorationRole and col == 0:
+            return self._thumbnail_icon(e.path)
         if role == Qt.ItemDataRole.ToolTipRole:
             return str(e.path)
         if role == Qt.ItemDataRole.ForegroundRole and not e.enabled:
@@ -248,6 +286,37 @@ class DlcFilterProxy(QSortFilterProxyModel):
 # ---------------------------------------------------------------------------
 # Scan worker
 # ---------------------------------------------------------------------------
+
+class _ThumbSignals(QObject):
+    ready = Signal(int, object)   # gen, Path
+
+
+class _ThumbRunnable(QRunnable):
+    """Build thumbnails for a list of PSARC paths in a worker thread."""
+
+    def __init__(self, paths: list[Path], cache_dir: Path, gen: int) -> None:
+        super().__init__()
+        self.paths = paths
+        self.cache_dir = cache_dir
+        self.gen = gen
+        self.signals = _ThumbSignals()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        for p in self.paths:
+            if self._cancelled:
+                return
+            try:
+                out = build_thumbnail(p, self.cache_dir, target_size=_THUMB_SIZE)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("thumbnail failed for %s", p)
+                continue
+            if out is not None:
+                self.signals.ready.emit(self.gen, p)
+
 
 class _ScanSignals(QObject):
     chunk = Signal(int, object)           # gen, list[DlcEntry]
@@ -376,7 +445,8 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.verticalHeader().setDefaultSectionSize(_THUMB_SIZE + 8)
+        self.table.setIconSize(QSize(_THUMB_SIZE, _THUMB_SIZE))
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)   # Artiste
@@ -461,6 +531,9 @@ class MainWindow(QMainWindow):
 
         self._pool = QThreadPool.globalInstance()
         self._scan_gen = 0
+        self._thumb_runnable: _ThumbRunnable | None = None
+        self._thumb_cache_dir = Path.home() / ".rs-dlc-manager" / "thumbnails"
+        self.model.set_thumbnail_cache_dir(self._thumb_cache_dir)
         self._update_status_label()
         self._refresh_undo_state()
         self._refresh_trash_label()
@@ -468,6 +541,9 @@ class MainWindow(QMainWindow):
 
     # ---- scanning ----
     def start_scan(self, force: bool) -> None:
+        if self._thumb_runnable is not None:
+            self._thumb_runnable.cancel()
+            self._thumb_runnable = None
         self._scan_gen += 1
         self.model.set_rows([])
         self._known_tunings: set[str] = set()
@@ -510,11 +586,34 @@ class MainWindow(QMainWindow):
             self.tuning_combo.blockSignals(False)
         self._update_status_label()
 
-    def _on_finished(self, gen: int, _entries: list[DlcEntry]) -> None:
+    def _on_finished(self, gen: int, entries: list[DlcEntry]) -> None:
         if gen != self._scan_gen:
             return
         self.status.showMessage("Scan terminé", 4000)
         self._update_status_label()
+        self._start_thumbnail_build(entries)
+
+    def _start_thumbnail_build(self, entries: list[DlcEntry]) -> None:
+        seen: set[Path] = set()
+        paths: list[Path] = []
+        for e in entries:
+            if e.path in seen:
+                continue
+            seen.add(e.path)
+            png = cache_path_for(e.path, self._thumb_cache_dir)
+            if not png.is_file():
+                paths.append(e.path)
+        if not paths:
+            return
+        runnable = _ThumbRunnable(paths, self._thumb_cache_dir, gen=self._scan_gen)
+        runnable.signals.ready.connect(self._on_thumbnail_ready)
+        self._thumb_runnable = runnable
+        self._pool.start(runnable)
+
+    def _on_thumbnail_ready(self, gen: int, path: Path) -> None:
+        if gen != self._scan_gen:
+            return
+        self.model.notify_thumbnail_ready(path)
 
     def _on_error(self, gen: int, msg: str) -> None:
         if gen != self._scan_gen:
