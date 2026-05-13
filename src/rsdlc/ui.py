@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from rsdlc.albumart import build_thumbnail, cache_path_for
 from rsdlc.duplicates import duplicate_keys, is_duplicate
+from rsdlc.favorites import Favorites
 from rsdlc.icons import icon
 from rsdlc.library import DlcEntry, Library
 from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
@@ -38,8 +39,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _COLUMNS: tuple[str, ...] = (
-    "Artiste", "Titre", "Année", "Album", "Arrangements", "Accordage", "Statut",
+    "Artiste", "Titre", "Année", "Album", "Arrangements", "Accordage", "Statut", "★",
 )
+_COL_FAVORITE = 7
 
 
 _THUMB_SIZE = 40  # px
@@ -53,6 +55,33 @@ class DlcTableModel(QAbstractTableModel):
         self._rows: list[DlcEntry] = []
         self._thumb_cache_dir: Path | None = None
         self._thumb_qicon_cache: dict[Path, QIcon] = {}
+        self._favorites: Favorites | None = None
+        self._star_icon: QIcon | None = None
+        self._star_fill_icon: QIcon | None = None
+
+    def set_favorites(self, favorites: Favorites) -> None:
+        self._favorites = favorites
+        # Lazy-construct the icons the first time we have a QApplication.
+        self._star_icon = icon("star", size=18)
+        self._star_fill_icon = icon("star-fill", size=18, color=QColor("#f5c518"))
+
+    def is_favorite(self, p: Path) -> bool:
+        return self._favorites is not None and self._favorites.contains(p)
+
+    def toggle_favorite(self, p: Path) -> bool:
+        if self._favorites is None:
+            return False
+        new_state = self._favorites.toggle(p)
+        # Repaint every row that shares this path.
+        for row, e in enumerate(self._rows):
+            if e.path == p:
+                idx = self.index(row, _COL_FAVORITE)
+                self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+        return new_state
+
+    def rename_favorite(self, old: Path, new: Path) -> None:
+        if self._favorites is not None:
+            self._favorites.rename(old, new)
 
     # ---- rows ----
     def set_rows(self, entries: list[DlcEntry]) -> None:
@@ -198,6 +227,12 @@ class DlcTableModel(QAbstractTableModel):
             if col == 6: return "● actif" if e.enabled else "○ désactivé"
         if role == Qt.ItemDataRole.DecorationRole and col == 0:
             return self._thumbnail_icon(e.path)
+        if role == Qt.ItemDataRole.DecorationRole and col == _COL_FAVORITE:
+            if self.is_favorite(e.path):
+                return self._star_fill_icon
+            return self._star_icon
+        if role == Qt.ItemDataRole.TextAlignmentRole and col == _COL_FAVORITE:
+            return int(Qt.AlignmentFlag.AlignCenter)
         if role == Qt.ItemDataRole.ToolTipRole:
             return str(e.path)
         if role == Qt.ItemDataRole.ForegroundRole and not e.enabled:
@@ -218,7 +253,7 @@ class DlcFilterProxy(QSortFilterProxyModel):
     def __init__(self) -> None:
         super().__init__()
         self._search = ""
-        self._status = "all"      # all | active | disabled | duplicates
+        self._status = "all"      # all | active | disabled | duplicates | favorites
         self._tuning = ""         # "" = all, otherwise must match tuning_label
         self._dup_set: set[tuple[str, str]] | None = None
 
@@ -273,6 +308,10 @@ class DlcFilterProxy(QSortFilterProxyModel):
             return False
         if self._status == "duplicates":
             if not is_duplicate(e, self._ensure_dup_set()):
+                return False
+        if self._status == "favorites":
+            model = self.sourceModel()
+            if not isinstance(model, DlcTableModel) or not model.is_favorite(e.path):
                 return False
         if self._tuning and e.tuning_label != self._tuning:
             return False
@@ -419,6 +458,7 @@ class MainWindow(QMainWindow):
         self.status_combo.addItem("Actifs", "active")
         self.status_combo.addItem("Désactivés", "disabled")
         self.status_combo.addItem("Doublons", "duplicates")
+        self.status_combo.addItem("Favoris", "favorites")
         self.status_combo.currentIndexChanged.connect(
             lambda _i: self.proxy.set_status(self.status_combo.currentData())
         )
@@ -456,7 +496,10 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(_COL_FAVORITE, QHeaderView.ResizeMode.Fixed)
         header.setHighlightSections(False)
+        self.table.setColumnWidth(_COL_FAVORITE, 40)
+        self.table.clicked.connect(self._on_table_clicked)
         self.table.setColumnWidth(0, 220)
         self.table.setColumnWidth(3, 200)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -534,6 +577,14 @@ class MainWindow(QMainWindow):
         self._thumb_runnable: _ThumbRunnable | None = None
         self._thumb_cache_dir = Path.home() / ".rs-dlc-manager" / "thumbnails"
         self.model.set_thumbnail_cache_dir(self._thumb_cache_dir)
+        self._favorites = Favorites(Path.home() / ".rs-dlc-manager" / "favorites.json")
+        self.model.set_favorites(self._favorites)
+
+        # Ctrl+B or F: toggle favorite on selection
+        act_fav = QAction(self)
+        act_fav.setShortcut(QKeySequence("F"))
+        act_fav.triggered.connect(self._toggle_favorite_on_selection)
+        self.addAction(act_fav)
         self._update_status_label()
         self._refresh_undo_state()
         self._refresh_trash_label()
@@ -727,6 +778,7 @@ class MainWindow(QMainWindow):
                 logger.warning("%s failed for %s: %s",
                                "enable" if enable else "disable", e.path, exc)
                 continue
+            self.model.rename_favorite(e.path, new_path)
             updates.append((e.path, new_path, enable))
         if updates:
             self.model.replace_paths_batch(updates)
@@ -788,6 +840,27 @@ class MainWindow(QMainWindow):
         self.search.setFocus()
         self.search.selectAll()
 
+    def _on_table_clicked(self, proxy_idx: QModelIndex) -> None:
+        if proxy_idx.column() != _COL_FAVORITE:
+            return
+        src_idx = self.proxy.mapToSource(proxy_idx)
+        e = self.model.entry(src_idx.row())
+        self.model.toggle_favorite(e.path)
+        # If we're filtering on favorites, the row may have disappeared.
+        self.proxy.invalidateFilter()
+
+    def _toggle_favorite_on_selection(self) -> None:
+        seen: set[Path] = set()
+        for proxy_idx in self.table.selectionModel().selectedRows():
+            src_idx = self.proxy.mapToSource(proxy_idx)
+            e = self.model.entry(src_idx.row())
+            if e.path in seen:
+                continue
+            seen.add(e.path)
+            self.model.toggle_favorite(e.path)
+        if seen:
+            self.proxy.invalidateFilter()
+
     def show_stats(self) -> None:
         entries = self.model.all_entries()
         s = compute_stats(entries)
@@ -842,6 +915,7 @@ class MainWindow(QMainWindow):
         widths = [self.table.columnWidth(i) for i in range(self.model.columnCount())]
         self.settings.setValue("columns", widths)
         self.library.cache.save()
+        self._favorites.save()
         super().closeEvent(event)
 
 
