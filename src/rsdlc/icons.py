@@ -70,6 +70,15 @@ _SVG: dict[str, str] = {
         '6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.93a2 2 0 0 1 '
         '1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 1 2 2v2"/></svg>'
     ),
+    "bar-chart-3": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+        'fill="none" stroke="currentColor" stroke-width="2" '
+        'stroke-linecap="round" stroke-linejoin="round">'
+        '<path d="M3 3v18h18"/>'
+        '<path d="M18 17V9"/>'
+        '<path d="M13 17V5"/>'
+        '<path d="M8 17v-3"/></svg>'
+    ),
 }
 
 

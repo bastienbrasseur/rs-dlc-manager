@@ -18,14 +18,15 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
 )
 
 from rsdlc.icons import icon
 from rsdlc.library import DlcEntry, Library
 from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
+from rsdlc.stats import compute_stats, format_duration
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +393,10 @@ class MainWindow(QMainWindow):
         act_undo.triggered.connect(self.undo_last)
         tb.addAction(act_undo)
         tb.addSeparator()
+        act_stats = QAction(icon("bar-chart-3"), "Statistiques", self)
+        act_stats.triggered.connect(self.show_stats)
+        tb.addAction(act_stats)
+        tb.addSeparator()
         act_pick = QAction(icon("folder-open"), "Changer de dossier…", self)
         act_pick.triggered.connect(self.pick_folder)
         tb.addAction(act_pick)
@@ -649,6 +654,54 @@ class MainWindow(QMainWindow):
     def _focus_search(self) -> None:
         self.search.setFocus()
         self.search.selectAll()
+
+    def show_stats(self) -> None:
+        entries = self.model.all_entries()
+        s = compute_stats(entries)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Statistiques")
+        dlg.resize(420, 520)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        def section(title: str) -> QLabel:
+            lbl = QLabel(title)
+            f = lbl.font()
+            f.setBold(True)
+            f.setPointSize(f.pointSize() + 1)
+            lbl.setFont(f)
+            return lbl
+
+        def line(left: str, right: str) -> QLabel:
+            return QLabel(f"<span style='color:#888'>{left}</span>  &nbsp;&nbsp;{right}")
+
+        layout.addWidget(section("Vue d'ensemble"))
+        layout.addWidget(line("Fichiers", f"{s.total_files}"))
+        layout.addWidget(line("Actifs", f"{s.active_files}"))
+        layout.addWidget(line("Désactivés", f"{s.disabled_files}"))
+        layout.addWidget(line("Chansons", f"{s.total_songs}"))
+        layout.addWidget(line("Durée totale", format_duration(s.total_seconds)))
+        if s.songs_without_metadata:
+            layout.addWidget(line("Sans métadonnées", str(s.songs_without_metadata)))
+
+        if s.by_tuning:
+            layout.addWidget(section("Accordages"))
+            for name, n in s.by_tuning[:8]:
+                layout.addWidget(line(name, f"{n}"))
+
+        if s.by_decade:
+            layout.addWidget(section("Par décennie"))
+            for decade, n in s.by_decade:
+                layout.addWidget(line(f"{decade}s", f"{n}"))
+
+        if s.top_artists:
+            layout.addWidget(section("Top artistes"))
+            for name, n in s.top_artists:
+                layout.addWidget(line(name, f"{n}"))
+
+        layout.addStretch(1)
+        dlg.exec()
 
     # ---- persistence ----
     def closeEvent(self, event: Any) -> None:
