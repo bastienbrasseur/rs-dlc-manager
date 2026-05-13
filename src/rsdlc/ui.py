@@ -13,8 +13,9 @@ from typing import Any
 
 import qdarktheme
 from PySide6.QtCore import (
-    QAbstractTableModel, QModelIndex, QObject, QPersistentModelIndex, QPoint,
-    QRunnable, QSettings, QSize, QSortFilterProxyModel, Qt, QThreadPool, Signal,
+    QAbstractItemModel, QAbstractTableModel, QModelIndex, QObject,
+    QPersistentModelIndex, QPoint, QRunnable, QSettings, QSize,
+    QSortFilterProxyModel, Qt, QThreadPool, Signal,
 )
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
 )
 
+from rsdlc.duplicates import duplicate_keys, is_duplicate
 from rsdlc.icons import icon
 from rsdlc.library import DlcEntry, Library
 from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
@@ -178,8 +180,36 @@ class DlcFilterProxy(QSortFilterProxyModel):
     def __init__(self) -> None:
         super().__init__()
         self._search = ""
-        self._status = "all"      # all | active | disabled
+        self._status = "all"      # all | active | disabled | duplicates
         self._tuning = ""         # "" = all, otherwise must match tuning_label
+        self._dup_set: set[tuple[str, str]] | None = None
+
+    def setSourceModel(self, source_model: QAbstractItemModel) -> None:
+        old = self.sourceModel()
+        if isinstance(old, QAbstractItemModel):
+            try:
+                old.modelReset.disconnect(self._invalidate_dup_cache)
+                old.rowsInserted.disconnect(self._invalidate_dup_cache)
+                old.rowsRemoved.disconnect(self._invalidate_dup_cache)
+            except (RuntimeError, TypeError):
+                pass
+        super().setSourceModel(source_model)
+        self._dup_set = None
+        source_model.modelReset.connect(self._invalidate_dup_cache)
+        source_model.rowsInserted.connect(self._invalidate_dup_cache)
+        source_model.rowsRemoved.connect(self._invalidate_dup_cache)
+
+    def _invalidate_dup_cache(self, *_args: object) -> None:
+        self._dup_set = None
+        if self._status == "duplicates":
+            self.invalidateFilter()
+
+    def _ensure_dup_set(self) -> set[tuple[str, str]]:
+        if self._dup_set is None:
+            model = self.sourceModel()
+            entries = model.all_entries() if isinstance(model, DlcTableModel) else []
+            self._dup_set = duplicate_keys(entries)
+        return self._dup_set
 
     def set_search(self, text: str) -> None:
         self._search = text.casefold().strip()
@@ -203,6 +233,9 @@ class DlcFilterProxy(QSortFilterProxyModel):
             return False
         if self._status == "disabled" and e.enabled:
             return False
+        if self._status == "duplicates":
+            if not is_duplicate(e, self._ensure_dup_set()):
+                return False
         if self._tuning and e.tuning_label != self._tuning:
             return False
         if self._search:
@@ -316,6 +349,7 @@ class MainWindow(QMainWindow):
         self.status_combo.addItem("Tous", "all")
         self.status_combo.addItem("Actifs", "active")
         self.status_combo.addItem("Désactivés", "disabled")
+        self.status_combo.addItem("Doublons", "duplicates")
         self.status_combo.currentIndexChanged.connect(
             lambda _i: self.proxy.set_status(self.status_combo.currentData())
         )
