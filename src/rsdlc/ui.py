@@ -1,0 +1,750 @@
+"""Qt UI for rs-dlc-manager.
+
+Single entry point: :func:`run`. The rest of the project (parsing, library,
+paths) is import-safe without Qt — Qt symbols are only imported in this module.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from pathlib import Path
+from typing import Any
+
+import qdarktheme
+from PySide6.QtCore import (
+    QAbstractTableModel, QModelIndex, QObject, QPersistentModelIndex, QPoint,
+    QRunnable, QSettings, QSize, QSortFilterProxyModel, Qt, QThreadPool, Signal,
+)
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+    QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
+)
+
+from rsdlc.icons import icon
+from rsdlc.library import DlcEntry, Library
+from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Table model
+# ---------------------------------------------------------------------------
+
+_COLUMNS: tuple[str, ...] = (
+    "Artiste", "Titre", "Année", "Album", "Arrangements", "Accordage", "Statut",
+)
+
+
+class DlcTableModel(QAbstractTableModel):
+    """Adapts a list of :class:`DlcEntry` for QTableView."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._rows: list[DlcEntry] = []
+
+    # ---- rows ----
+    def set_rows(self, entries: list[DlcEntry]) -> None:
+        self.beginResetModel()
+        self._rows = list(entries)
+        self.endResetModel()
+
+    def append_rows(self, entries: list[DlcEntry]) -> None:
+        if not entries:
+            return
+        start = len(self._rows)
+        self.beginInsertRows(QModelIndex(), start, start + len(entries) - 1)
+        self._rows.extend(entries)
+        self.endInsertRows()
+
+    def entry(self, row: int) -> DlcEntry:
+        return self._rows[row]
+
+    def all_entries(self) -> list[DlcEntry]:
+        return list(self._rows)
+
+    def replace_entry(self, row: int, new_entry: DlcEntry) -> None:
+        if 0 <= row < len(self._rows):
+            self._rows[row] = new_entry
+            top_left = self.index(row, 0)
+            bottom_right = self.index(row, self.columnCount() - 1)
+            self.dataChanged.emit(top_left, bottom_right)
+
+    def replace_path(self, old_path: Path, new_path: Path, enabled: bool) -> None:
+        """Update every row whose path == old_path."""
+        old_resolved = old_path.resolve()
+        for row, e in enumerate(self._rows):
+            if e.path.resolve() == old_resolved:
+                self._rows[row] = DlcEntry(
+                    path=new_path, enabled=enabled,
+                    title=e.title, artist=e.artist, album=e.album,
+                    year=e.year, length_seconds=e.length_seconds,
+                    arrangement_label=e.arrangement_label,
+                    tuning_label=e.tuning_label,
+                )
+        self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
+
+    def remove_paths(self, paths: list[Path]) -> None:
+        """Drop every row whose path matches one of the given paths.
+
+        Uses a single model reset — for hundreds of removals at once this is
+        far faster than per-row signals.
+        """
+        targets = {p.resolve() for p in paths}
+        if not targets:
+            return
+        self.beginResetModel()
+        self._rows = [e for e in self._rows if e.path.resolve() not in targets]
+        self.endResetModel()
+
+    def replace_paths_batch(self, updates: list[tuple[Path, Path, bool]]) -> None:
+        """Apply many ``(old_path, new_path, enabled)`` swaps with one dataChanged."""
+        if not updates:
+            return
+        update_map: dict[Path, tuple[Path, bool]] = {
+            old.resolve(): (new, en) for old, new, en in updates
+        }
+        for row, e in enumerate(self._rows):
+            target = update_map.get(e.path.resolve())
+            if target is None:
+                continue
+            new_path, enabled = target
+            self._rows[row] = DlcEntry(
+                path=new_path, enabled=enabled,
+                title=e.title, artist=e.artist, album=e.album,
+                year=e.year, length_seconds=e.length_seconds,
+                arrangement_label=e.arrangement_label,
+                tuning_label=e.tuning_label,
+            )
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._rows) - 1, self.columnCount() - 1),
+            )
+
+    # ---- QAbstractTableModel API ----
+    def rowCount(self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def columnCount(self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(_COLUMNS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation,
+                   role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return _COLUMNS[section]
+        return section + 1
+
+    def data(self, index: QModelIndex | QPersistentModelIndex,
+             role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid():
+            return None
+        row, col = index.row(), index.column()
+        e = self._rows[row]
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == 0: return e.artist
+            if col == 1: return e.title
+            if col == 2: return "" if e.year is None else str(e.year)
+            if col == 3: return e.album
+            if col == 4: return e.arrangement_label
+            if col == 5: return e.tuning_label
+            if col == 6: return "● actif" if e.enabled else "○ désactivé"
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return str(e.path)
+        if role == Qt.ItemDataRole.ForegroundRole and not e.enabled:
+            # Dim the entire row so disabled DLC are visually muted.
+            return QBrush(QColor(140, 140, 140))
+        if role == Qt.ItemDataRole.FontRole and not e.enabled:
+            font = QFont()
+            font.setItalic(True)
+            return font
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Filter proxy
+# ---------------------------------------------------------------------------
+
+class DlcFilterProxy(QSortFilterProxyModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self._search = ""
+        self._status = "all"      # all | active | disabled
+        self._tuning = ""         # "" = all, otherwise must match tuning_label
+
+    def set_search(self, text: str) -> None:
+        self._search = text.casefold().strip()
+        self.invalidateFilter()
+
+    def set_status(self, status: str) -> None:
+        self._status = status
+        self.invalidateFilter()
+
+    def set_tuning(self, tuning: str) -> None:
+        self._tuning = tuning
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int,
+                         source_parent: QModelIndex | QPersistentModelIndex) -> bool:
+        model = self.sourceModel()
+        if not isinstance(model, DlcTableModel):
+            return True
+        e = model.entry(source_row)
+        if self._status == "active" and not e.enabled:
+            return False
+        if self._status == "disabled" and e.enabled:
+            return False
+        if self._tuning and e.tuning_label != self._tuning:
+            return False
+        if self._search:
+            hay = f"{e.artist} {e.title} {e.album}".casefold()
+            if self._search not in hay:
+                return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Scan worker
+# ---------------------------------------------------------------------------
+
+class _ScanSignals(QObject):
+    chunk = Signal(int, object)           # gen, list[DlcEntry]
+    finished = Signal(int, object)        # gen, list[DlcEntry]
+    error = Signal(int, str)              # gen, message
+
+
+class _ScanRunnable(QRunnable):
+    def __init__(self, library: Library, force: bool, gen: int) -> None:
+        super().__init__()
+        self.library = library
+        self.force = force
+        self.gen = gen
+        self.signals = _ScanSignals()
+        self._emitted = 0
+
+    def run(self) -> None:
+        def on_chunk(_path: Path, entries: list[DlcEntry]) -> None:
+            new = entries[self._emitted:]
+            self._emitted = len(entries)
+            if new:
+                self.signals.chunk.emit(self.gen, new)
+        try:
+            self.library.scan(force=self.force, on_chunk=on_chunk, chunk_size=20)
+            remaining = self.library.entries[self._emitted:]
+            if remaining:
+                self.signals.chunk.emit(self.gen, remaining)
+            self.signals.finished.emit(self.gen, self.library.entries)
+        except Exception as exc:
+            logger.exception("scan failed")
+            self.signals.error.emit(self.gen, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+_QSS = """
+QMainWindow, QWidget { font-size: 10pt; }
+QToolBar {
+    spacing: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid rgba(127,127,127,40);
+}
+QLineEdit, QComboBox {
+    padding: 6px 10px;
+    min-height: 22px;
+    border-radius: 6px;
+}
+QPushButton {
+    padding: 6px 14px;
+    min-height: 22px;
+    border-radius: 6px;
+}
+QTableView {
+    gridline-color: rgba(127,127,127,30);
+    selection-background-color: #3a6ea5;
+    selection-color: white;
+}
+QTableView::item { padding: 6px 8px; }
+QHeaderView::section {
+    padding: 8px 10px;
+    border: none;
+    border-bottom: 1px solid rgba(127,127,127,60);
+    font-weight: 600;
+}
+QStatusBar { padding: 4px 10px; }
+"""
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, library: Library) -> None:
+        super().__init__()
+        self.library = library
+        self.setWindowTitle("rs-dlc-manager — Rocksmith 2014 DLC")
+        self.resize(1100, 640)
+
+        self.model = DlcTableModel()
+        self.proxy = DlcFilterProxy()
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setSortRole(Qt.ItemDataRole.DisplayRole)
+
+        # ---- central layout ----
+        central = QWidget(self)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        # filter bar
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Rechercher (artiste, titre, album)…  —  Ctrl+F")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.proxy.set_search)
+        bar.addWidget(self.search, 4)
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItem("Tous", "all")
+        self.status_combo.addItem("Actifs", "active")
+        self.status_combo.addItem("Désactivés", "disabled")
+        self.status_combo.currentIndexChanged.connect(
+            lambda _i: self.proxy.set_status(self.status_combo.currentData())
+        )
+        bar.addWidget(QLabel("Statut"))
+        bar.addWidget(self.status_combo, 1)
+
+        self.tuning_combo = QComboBox()
+        self.tuning_combo.addItem("Tous accordages", "")
+        self.tuning_combo.currentIndexChanged.connect(
+            lambda _i: self.proxy.set_tuning(self.tuning_combo.currentData())
+        )
+        bar.addWidget(QLabel("Accordage"))
+        bar.addWidget(self.tuning_combo, 2)
+
+        outer.addLayout(bar)
+
+        # table
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)   # Artiste
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)        # Titre
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setHighlightSections(False)
+        self.table.setColumnWidth(0, 220)
+        self.table.setColumnWidth(3, 200)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+        outer.addWidget(self.table)
+
+        self.setCentralWidget(central)
+
+        # ---- toolbar ----
+        tb = QToolBar("Actions")
+        tb.setMovable(False)
+        tb.setIconSize(tb.iconSize())
+        self.addToolBar(tb)
+        tb.setIconSize(QSize(18, 18))
+        act_disable = QAction(icon("eye-off"), "Désactiver", self)
+        act_disable.triggered.connect(self.disable_selected)
+        tb.addAction(act_disable)
+        act_enable = QAction(icon("eye"), "Activer", self)
+        act_enable.setShortcut(QKeySequence(Qt.Key.Key_Return))
+        act_enable.triggered.connect(self.enable_selected)
+        tb.addAction(act_enable)
+        tb.addSeparator()
+        act_trash = QAction(icon("trash-2"), "Supprimer (Suppr)", self)
+        act_trash.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        act_trash.triggered.connect(self.trash_selected)
+        tb.addAction(act_trash)
+        act_empty = QAction(icon("flame"), "Vider la corbeille", self)
+        act_empty.triggered.connect(self.empty_trash)
+        tb.addAction(act_empty)
+        self._act_empty = act_empty
+        tb.addSeparator()
+        act_rescan = QAction(icon("refresh-cw"), "Rescanner", self)
+        act_rescan.setShortcut(QKeySequence("Ctrl+R"))
+        act_rescan.triggered.connect(lambda: self.start_scan(force=True))
+        tb.addAction(act_rescan)
+        act_undo = QAction(icon("undo-2"), "Annuler (Ctrl+Z)", self)
+        act_undo.setShortcut(QKeySequence("Ctrl+Z"))
+        act_undo.triggered.connect(self.undo_last)
+        tb.addAction(act_undo)
+        tb.addSeparator()
+        act_pick = QAction(icon("folder-open"), "Changer de dossier…", self)
+        act_pick.triggered.connect(self.pick_folder)
+        tb.addAction(act_pick)
+        self._act_undo = act_undo
+
+        # Ctrl+F → search focus
+        focus_search = QAction(self)
+        focus_search.setShortcut(QKeySequence("Ctrl+F"))
+        focus_search.triggered.connect(self._focus_search)
+        self.addAction(focus_search)
+
+        # ---- status bar ----
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+        self.status_label = QLabel("")
+        self.status.addPermanentWidget(self.status_label)
+
+        # ---- settings + first scan ----
+        self.settings = QSettings("Apptic", "rs-dlc-manager")
+        geom = self.settings.value("geometry")
+        if isinstance(geom, (bytes, bytearray)):
+            self.restoreGeometry(geom)
+        col_sizes = self.settings.value("columns")
+        if isinstance(col_sizes, list):
+            for i, w in enumerate(col_sizes):
+                if isinstance(w, int) and w > 0 and i < self.model.columnCount():
+                    self.table.setColumnWidth(i, w)
+
+        self._pool = QThreadPool.globalInstance()
+        self._scan_gen = 0
+        self._update_status_label()
+        self._refresh_undo_state()
+        self._refresh_trash_label()
+        self.start_scan(force=False)
+
+    # ---- scanning ----
+    def start_scan(self, force: bool) -> None:
+        self._scan_gen += 1
+        self.model.set_rows([])
+        self._known_tunings: set[str] = set()
+        self.tuning_combo.blockSignals(True)
+        self.tuning_combo.clear()
+        self.tuning_combo.addItem("Tous accordages", "")
+        self.tuning_combo.blockSignals(False)
+        self.status.showMessage("Scan en cours…")
+        runnable = _ScanRunnable(self.library, force=force, gen=self._scan_gen)
+        runnable.signals.chunk.connect(self._on_chunk)
+        runnable.signals.finished.connect(self._on_finished)
+        runnable.signals.error.connect(self._on_error)
+        self._pool.start(runnable)
+
+    def _on_chunk(self, gen: int, new_entries: list[DlcEntry]) -> None:
+        if gen != self._scan_gen:
+            return  # stale event from a previous scan generation
+        self.model.append_rows(new_entries)
+        # learn new tunings
+        added = False
+        for e in new_entries:
+            if e.tuning_label and e.tuning_label not in self._known_tunings:
+                self._known_tunings.add(e.tuning_label)
+                self.tuning_combo.addItem(e.tuning_label, e.tuning_label)
+                added = True
+        if added:
+            # keep alphabetical order from the 2nd item onward
+            data = [(self.tuning_combo.itemText(i), self.tuning_combo.itemData(i))
+                    for i in range(1, self.tuning_combo.count())]
+            data.sort(key=lambda x: x[0].lower())
+            current = self.tuning_combo.currentData()
+            self.tuning_combo.blockSignals(True)
+            while self.tuning_combo.count() > 1:
+                self.tuning_combo.removeItem(1)
+            for text, val in data:
+                self.tuning_combo.addItem(text, val)
+            idx = self.tuning_combo.findData(current)
+            if idx >= 0:
+                self.tuning_combo.setCurrentIndex(idx)
+            self.tuning_combo.blockSignals(False)
+        self._update_status_label()
+
+    def _on_finished(self, gen: int, _entries: list[DlcEntry]) -> None:
+        if gen != self._scan_gen:
+            return
+        self.status.showMessage("Scan terminé", 4000)
+        self._update_status_label()
+
+    def _on_error(self, gen: int, msg: str) -> None:
+        if gen != self._scan_gen:
+            return
+        logger.error("scan error (gen %d): %s", gen, msg)
+        self.status.showMessage(f"Erreur durant le scan: {msg}", 6000)
+
+    def _update_status_label(self) -> None:
+        entries = self.model.all_entries()
+        # Count unique psarc files, not songs
+        active_files = {e.path for e in entries if e.enabled}
+        disabled_files = {e.path for e in entries if not e.enabled}
+        total = len(active_files) + len(disabled_files)
+        self.status_label.setText(
+            f"{len(active_files)} actifs  ·  {len(disabled_files)} désactivés  ·  {total} total"
+        )
+
+    # ---- selection actions ----
+    def _selected_unique_paths(self, want_enabled: bool | None = None) -> list[tuple[int, DlcEntry]]:
+        sel = self.table.selectionModel().selectedRows()
+        out: list[tuple[int, DlcEntry]] = []
+        seen: set[Path] = set()
+        for proxy_idx in sel:
+            src_idx = self.proxy.mapToSource(proxy_idx)
+            row = src_idx.row()
+            e = self.model.entry(row)
+            if want_enabled is not None and e.enabled is not want_enabled:
+                continue
+            if e.path in seen:
+                continue
+            seen.add(e.path)
+            out.append((row, e))
+        return out
+
+    def disable_selected(self) -> None:
+        self._toggle_selected(enable=False)
+
+    def enable_selected(self) -> None:
+        self._toggle_selected(enable=True)
+
+    def trash_selected(self) -> None:
+        """Move every selected PSARC to the trash. Silent — undoable via Ctrl+Z."""
+        targets = self._selected_unique_paths()
+        if not targets:
+            return
+        moved: list[Path] = []
+        for _row, e in targets:
+            try:
+                self.library.trash(e.path)
+                moved.append(e.path)
+            except (OSError, ValueError) as exc:
+                logger.warning("trash failed for %s: %s", e.path, exc)
+        if moved:
+            self.model.remove_paths(moved)
+        self._refresh_undo_state()
+        self._refresh_trash_label()
+        self._update_status_label()
+
+    def empty_trash(self) -> None:
+        """Permanently delete every file currently in the trash."""
+        n = self.library.empty_trash()
+        self._refresh_trash_label()
+        self._refresh_undo_state()
+        if n:
+            self.status.showMessage(f"Corbeille vidée — {n} fichier(s) supprimé(s)", 4000)
+        else:
+            self.status.showMessage("Corbeille déjà vide", 2000)
+
+    def _refresh_trash_label(self) -> None:
+        n = len(self.library.trash_files())
+        self._act_empty.setText(f"Vider la corbeille ({n})")
+        self._act_empty.setEnabled(n > 0)
+
+    def _on_table_context_menu(self, pos: QPoint) -> None:
+        idx_at_pos = self.table.indexAt(pos)
+        if idx_at_pos.isValid():
+            sm = self.table.selectionModel()
+            if not sm.isRowSelected(idx_at_pos.row(), idx_at_pos.parent()):
+                self.table.selectRow(idx_at_pos.row())
+
+        targets = self._selected_unique_paths()
+        if not targets:
+            return
+        has_active = any(e.enabled for _r, e in targets)
+        has_disabled = any(not e.enabled for _r, e in targets)
+
+        menu = QMenu(self)
+        act_disable = menu.addAction("Désactiver")
+        act_disable.setEnabled(has_active)
+        act_disable.triggered.connect(self.disable_selected)
+
+        act_enable = menu.addAction("Activer")
+        act_enable.setEnabled(has_disabled)
+        act_enable.triggered.connect(self.enable_selected)
+
+        menu.addSeparator()
+        act_delete = menu.addAction("Supprimer (Suppr)")
+        act_delete.triggered.connect(self.trash_selected)
+
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _toggle_selected(self, *, enable: bool) -> None:
+        targets = self._selected_unique_paths(want_enabled=not enable)
+        if not targets:
+            return
+        updates: list[tuple[Path, Path, bool]] = []
+        for _row, e in targets:
+            try:
+                new_path = self.library.enable(e.path) if enable else self.library.disable(e.path)
+            except (OSError, ValueError) as exc:
+                logger.warning("%s failed for %s: %s",
+                               "enable" if enable else "disable", e.path, exc)
+                continue
+            updates.append((e.path, new_path, enable))
+        if updates:
+            self.model.replace_paths_batch(updates)
+        self._refresh_undo_state()
+        self._update_status_label()
+
+    def undo_last(self) -> None:
+        if not self.library.can_undo():
+            return
+        last = self.library._undo[-1]
+        src_before, dst_after = last
+        restored = self.library.undo()
+        if restored is None:
+            return
+        enabled = self._is_under(restored, self.library.dlc_dir)
+        # If the undone move was a trash, the row no longer exists in the model
+        # (we removed it on trash). Replacing a non-existent path is a no-op,
+        # which is acceptable — the user can hit Ctrl+R to see it back.
+        self.model.replace_path(dst_after, restored, enabled=enabled)
+        self._refresh_undo_state()
+        self._refresh_trash_label()
+        self._update_status_label()
+
+    @staticmethod
+    def _is_under(child: Path, root: Path) -> bool:
+        try:
+            child.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _notify_errors(self, title: str, errs: list[tuple[Path, Exception]]) -> None:
+        lines = [f"{p.name} — {e}" for p, e in errs[:8]]
+        if len(errs) > 8:
+            lines.append(f"… et {len(errs) - 8} autres")
+        QMessageBox.warning(self, title, "\n".join(lines))
+
+    def _refresh_undo_state(self) -> None:
+        self._act_undo.setEnabled(self.library.can_undo())
+
+    # ---- folder picker ----
+    def pick_folder(self) -> None:
+        start = str(self.library.rocksmith_root)
+        chosen = QFileDialog.getExistingDirectory(self, "Dossier Rocksmith2014", start)
+        if not chosen:
+            return
+        new_root = Path(chosen)
+        if not (new_root / "dlc").is_dir() and not looks_like_rocksmith_root(new_root):
+            if QMessageBox.question(
+                self, "Dossier inhabituel",
+                f"{new_root} ne contient pas de sous-dossier dlc/. Continuer quand même ?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        self.library = Library(new_root)
+        self.settings.setValue("rocksmith_root", str(new_root))
+        self.start_scan(force=False)
+
+    def _focus_search(self) -> None:
+        self.search.setFocus()
+        self.search.selectAll()
+
+    # ---- persistence ----
+    def closeEvent(self, event: Any) -> None:
+        self.settings.setValue("geometry", self.saveGeometry())
+        widths = [self.table.columnWidth(i) for i in range(self.model.columnCount())]
+        self.settings.setValue("columns", widths)
+        self.library.cache.save()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Theme
+# ---------------------------------------------------------------------------
+
+def _apply_theme(app: QApplication) -> None:
+    """Apply qdarktheme + our custom QSS. Works with both pyqtdarktheme 1.x and 2.x."""
+    theme = "auto"
+    setup_theme = getattr(qdarktheme, "setup_theme", None)
+    if callable(setup_theme):
+        try:
+            setup_theme(theme, additional_qss=_QSS)
+            return
+        except TypeError:  # older 2.x signatures
+            setup_theme(theme)
+            app.setStyleSheet(app.styleSheet() + _QSS)
+            return
+    # pyqtdarktheme 1.x
+    load_stylesheet = getattr(qdarktheme, "load_stylesheet", None)
+    base = ""
+    if callable(load_stylesheet):
+        try:
+            base = load_stylesheet(theme)
+        except Exception:  # noqa: BLE001
+            base = load_stylesheet()
+    load_palette = getattr(qdarktheme, "load_palette", None)
+    if callable(load_palette):
+        try:
+            app.setPalette(load_palette(theme))
+        except Exception:  # noqa: BLE001
+            pass
+    app.setStyleSheet((base or "") + _QSS)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _choose_root(initial: Path | None) -> Path | None:
+    if initial and (initial / "dlc").is_dir():
+        return initial
+    if initial and looks_like_rocksmith_root(initial):
+        return initial
+    chosen = QFileDialog.getExistingDirectory(
+        None, "Sélectionne le dossier Rocksmith2014",
+        str(initial) if initial else "",
+    )
+    if not chosen:
+        return None
+    return Path(chosen)
+
+
+def run() -> int:
+    log_dir = Path.home() / ".rs-dlc-manager"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_dir / "log.txt", encoding="utf-8"),
+            logging.StreamHandler(sys.stderr),
+        ],
+    )
+    if "--debug" in sys.argv:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    app = QApplication(sys.argv)
+    _apply_theme(app)
+    app.setApplicationName("rs-dlc-manager")
+    app.setOrganizationName("Apptic")
+    QApplication.setFont(QFont(QApplication.font().family(), 10))
+
+    settings = QSettings("Apptic", "rs-dlc-manager")
+    stored_root = settings.value("rocksmith_root")
+    initial: Path | None = Path(stored_root) if isinstance(stored_root, str) else None
+    if initial is None or not initial.is_dir():
+        initial = autodetect_rocksmith_root()
+
+    root = _choose_root(initial)
+    if root is None:
+        return 1
+    settings.setValue("rocksmith_root", str(root))
+
+    library = Library(root)
+    window = MainWindow(library)
+    window.show()
+    return app.exec()
+
+
+__all__ = ["run", "MainWindow"]
