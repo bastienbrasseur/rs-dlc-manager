@@ -19,9 +19,10 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QDockWidget,
+    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPushButton, QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
 )
 
 from rsdlc.albumart import build_thumbnail, cache_path_for
@@ -30,6 +31,7 @@ from rsdlc.favorites import Favorites
 from rsdlc.icons import icon
 from rsdlc.library import DlcEntry, Library
 from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
+from rsdlc.setlists import SetlistError, SetlistStore
 from rsdlc.stats import compute_stats, format_duration
 
 logger = logging.getLogger(__name__)
@@ -555,6 +557,14 @@ class MainWindow(QMainWindow):
         focus_search.triggered.connect(self._focus_search)
         self.addAction(focus_search)
 
+        # ---- setlists dock ----
+        self._setlists = SetlistStore(
+            Path.home() / ".rs-dlc-manager" / "setlists.json",
+            Path.home() / ".rs-dlc-manager" / "setlist_state.json",
+        )
+        self._build_setlist_dock()
+        self._build_setlist_banner(outer)
+
         # ---- status bar ----
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -764,7 +774,44 @@ class MainWindow(QMainWindow):
         act_delete = menu.addAction("Supprimer (Suppr)")
         act_delete.triggered.connect(self.trash_selected)
 
+        menu.addSeparator()
+        add_menu = menu.addMenu("Ajouter à la setlist")
+        names = self._setlists.names()
+        if names:
+            for sl_name in names:
+                act = add_menu.addAction(sl_name)
+                act.triggered.connect(lambda _checked=False, n=sl_name: self._add_to_setlist(n))
+            add_menu.addSeparator()
+        act_new = add_menu.addAction("+ Nouvelle setlist…")
+        act_new.triggered.connect(self._add_to_new_setlist)
+
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _add_to_setlist(self, name: str) -> None:
+        paths = [e.path for _r, e in self._selected_unique_paths()]
+        if not paths:
+            return
+        try:
+            added = self._setlists.add_paths(name, paths)
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 4000)
+            return
+        self._setlists.save()
+        self.status.showMessage(
+            f"{added} chanson(s) ajoutée(s) à '{name}'", 3000,
+        )
+
+    def _add_to_new_setlist(self) -> None:
+        name, ok = QInputDialog.getText(self, "Nouvelle setlist", "Nom :")
+        if not ok or not name.strip():
+            return
+        try:
+            self._setlists.create(name.strip())
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 4000)
+            return
+        self._add_to_setlist(name.strip())
+        self._refresh_setlist_list()
 
     def _toggle_selected(self, *, enable: bool) -> None:
         targets = self._selected_unique_paths(want_enabled=not enable)
@@ -779,6 +826,7 @@ class MainWindow(QMainWindow):
                                "enable" if enable else "disable", e.path, exc)
                 continue
             self.model.rename_favorite(e.path, new_path)
+            self._setlists.rename_path(e.path, new_path)
             updates.append((e.path, new_path, enable))
         if updates:
             self.model.replace_paths_batch(updates)
@@ -839,6 +887,204 @@ class MainWindow(QMainWindow):
     def _focus_search(self) -> None:
         self.search.setFocus()
         self.search.selectAll()
+
+    # ---- setlists UI ----
+
+    def _build_setlist_dock(self) -> None:
+        dock = QDockWidget("Setlists", self)
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea
+                             | Qt.DockWidgetArea.RightDockWidgetArea)
+        dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
+                         | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+        self.setlist_list = QListWidget()
+        self.setlist_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.setlist_list.customContextMenuRequested.connect(self._on_setlist_context_menu)
+        self.setlist_list.itemSelectionChanged.connect(self._refresh_setlist_buttons)
+        v.addWidget(self.setlist_list, 1)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.btn_new_setlist = QPushButton("+ Nouveau")
+        self.btn_new_setlist.clicked.connect(self._create_setlist)
+        row.addWidget(self.btn_new_setlist)
+        self.btn_activate_setlist = QPushButton("Activer")
+        self.btn_activate_setlist.clicked.connect(self._activate_or_restore)
+        row.addWidget(self.btn_activate_setlist)
+        v.addLayout(row)
+        dock.setWidget(container)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self._refresh_setlist_list()
+
+    def _build_setlist_banner(self, outer: QVBoxLayout) -> None:
+        self.setlist_banner = QFrame()
+        self.setlist_banner.setObjectName("setlistBanner")
+        self.setlist_banner.setStyleSheet(
+            "QFrame#setlistBanner { background: #f5c518; border-radius: 6px; }"
+            "QFrame#setlistBanner QLabel { color: #1a1a1a; font-weight: 600; }"
+        )
+        h = QHBoxLayout(self.setlist_banner)
+        h.setContentsMargins(12, 8, 8, 8)
+        self.setlist_banner_label = QLabel("")
+        h.addWidget(self.setlist_banner_label, 1)
+        btn = QPushButton("Restaurer l'état précédent")
+        btn.clicked.connect(self._restore_setlist)
+        h.addWidget(btn)
+        outer.insertWidget(0, self.setlist_banner)
+        self._refresh_setlist_banner()
+
+    def _refresh_setlist_list(self) -> None:
+        previous = None
+        cur = self.setlist_list.currentItem()
+        if cur is not None:
+            previous = cur.text().lstrip("● ").strip()
+        self.setlist_list.clear()
+        for name in self._setlists.names():
+            label = f"● {name}" if name == self._setlists.active_name else name
+            it = QListWidgetItem(label)
+            it.setData(Qt.ItemDataRole.UserRole, name)
+            self.setlist_list.addItem(it)
+            if name == previous:
+                self.setlist_list.setCurrentItem(it)
+        self._refresh_setlist_buttons()
+
+    def _selected_setlist_name(self) -> str | None:
+        cur = self.setlist_list.currentItem()
+        if cur is None:
+            return None
+        name = cur.data(Qt.ItemDataRole.UserRole)
+        return str(name) if isinstance(name, str) else None
+
+    def _refresh_setlist_buttons(self) -> None:
+        name = self._selected_setlist_name()
+        active = self._setlists.active_name
+        if name is None:
+            self.btn_activate_setlist.setEnabled(False)
+            self.btn_activate_setlist.setText("Activer")
+            return
+        self.btn_activate_setlist.setEnabled(True)
+        if name == active:
+            self.btn_activate_setlist.setText("Restaurer")
+        elif active is not None:
+            self.btn_activate_setlist.setText("Basculer vers celle-ci")
+        else:
+            self.btn_activate_setlist.setText("Activer cette setlist")
+
+    def _refresh_setlist_banner(self) -> None:
+        name = self._setlists.active_name
+        if name is None:
+            self.setlist_banner.hide()
+        else:
+            self.setlist_banner_label.setText(f"Setlist active : {name}")
+            self.setlist_banner.show()
+
+    def _create_setlist(self) -> None:
+        name, ok = QInputDialog.getText(self, "Nouvelle setlist", "Nom :")
+        if not ok or not name.strip():
+            return
+        try:
+            self._setlists.create(name.strip())
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 4000)
+            return
+        self._setlists.save()
+        self._refresh_setlist_list()
+        # Select the newly created one
+        for i in range(self.setlist_list.count()):
+            it = self.setlist_list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == name.strip():
+                self.setlist_list.setCurrentItem(it)
+                break
+
+    def _activate_or_restore(self) -> None:
+        name = self._selected_setlist_name()
+        if name is None:
+            return
+        if self._setlists.active_name == name:
+            self._restore_setlist()
+            return
+        try:
+            if self._setlists.active_name is not None:
+                en, dis, errs = self._setlists.switch_to(name, self.library)
+            else:
+                en, dis, errs = self._setlists.activate(name, self.library)
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 6000)
+            return
+        if errs:
+            logger.warning("setlist apply errors: %s", errs)
+        self._setlists.save()
+        self.status.showMessage(
+            f"Setlist '{name}' activée — {en} activées, {dis} désactivées",
+            4000,
+        )
+        self._refresh_setlist_list()
+        self._refresh_setlist_banner()
+        self.start_scan(force=False)
+
+    def _restore_setlist(self) -> None:
+        if self._setlists.active_name is None:
+            return
+        try:
+            en, dis, errs = self._setlists.restore(self.library)
+        except SetlistError:
+            return
+        if errs:
+            logger.warning("setlist restore errors: %s", errs)
+        self._setlists.save()
+        self.status.showMessage(
+            f"État précédent restauré — {en} activées, {dis} désactivées",
+            4000,
+        )
+        self._refresh_setlist_list()
+        self._refresh_setlist_banner()
+        self.start_scan(force=False)
+
+    def _on_setlist_context_menu(self, pos: QPoint) -> None:
+        name = self._selected_setlist_name()
+        item = self.setlist_list.itemAt(pos)
+        if item is not None:
+            self.setlist_list.setCurrentItem(item)
+            name = self._selected_setlist_name()
+        if name is None:
+            return
+        menu = QMenu(self)
+        act_rename = menu.addAction("Renommer…")
+        act_rename.triggered.connect(self._rename_setlist)
+        act_delete = menu.addAction("Supprimer")
+        act_delete.setEnabled(self._setlists.active_name != name)
+        act_delete.triggered.connect(self._delete_setlist)
+        menu.exec(self.setlist_list.viewport().mapToGlobal(pos))
+
+    def _rename_setlist(self) -> None:
+        name = self._selected_setlist_name()
+        if name is None:
+            return
+        new, ok = QInputDialog.getText(self, "Renommer la setlist", "Nouveau nom :", text=name)
+        if not ok or not new.strip() or new.strip() == name:
+            return
+        try:
+            self._setlists.rename(name, new.strip())
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 4000)
+            return
+        self._setlists.save()
+        self._refresh_setlist_list()
+        self._refresh_setlist_banner()
+
+    def _delete_setlist(self) -> None:
+        name = self._selected_setlist_name()
+        if name is None:
+            return
+        try:
+            self._setlists.delete(name)
+        except SetlistError as exc:
+            self.status.showMessage(str(exc), 4000)
+            return
+        self._setlists.save()
+        self._refresh_setlist_list()
 
     def _on_table_clicked(self, proxy_idx: QModelIndex) -> None:
         if proxy_idx.column() != _COL_FAVORITE:
@@ -916,6 +1162,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("columns", widths)
         self.library.cache.save()
         self._favorites.save()
+        self._setlists.save()
         super().closeEvent(event)
 
 
