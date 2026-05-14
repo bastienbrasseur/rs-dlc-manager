@@ -93,7 +93,32 @@ _SVG: dict[str, str] = {
         '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 '
         '5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>'
     ),
+    "guitar": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+        'fill="none" stroke="currentColor" stroke-width="2" '
+        'stroke-linecap="round" stroke-linejoin="round">'
+        '<path d="m11.9 12.1 4.514-4.514"/>'
+        '<path d="M20.1 2.3a1 1 0 0 0-1.4 0l-1.114 1.114A2 2 0 0 0 17 4.828v1.344'
+        'a2 2 0 0 1-.586 1.414A2 2 0 0 1 17.828 7h1.344a2 2 0 0 0 1.414-.586'
+        'L21.7 5.3a1 1 0 0 0 0-1.4Z"/>'
+        '<path d="m6 16 2 2"/>'
+        '<path d="M8.2 9.9C8.7 8.8 9.8 8 11 8c2.8 0 5 2.2 5 5 0 1.2-.8 2.3-1.9 '
+        '2.8l-.9.4A2 2 0 0 0 12 18a4 4 0 0 1-4 4c-3.3 0-6-2.7-6-6a4 4 0 0 1 4-4 '
+        '2 2 0 0 0 1.8-1.2z"/></svg>'
+    ),
 }
+
+
+def app_icon() -> QIcon:
+    """Build the application icon (multiple sizes embedded for crisp scaling)."""
+    # Bright amber on transparent — readable on both light and dark taskbars.
+    color = QColor("#f5c518")
+    ic = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        # Re-render the SVG at each size for crisp rasters
+        rendered = icon("guitar", size=size, color=color).pixmap(size, size)
+        ic.addPixmap(rendered)
+    return ic
 
 
 def _palette_color() -> QColor:

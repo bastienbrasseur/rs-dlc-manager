@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 from rsdlc.albumart import build_thumbnail, cache_path_for
 from rsdlc.duplicates import duplicate_keys, is_duplicate
 from rsdlc.favorites import Favorites
-from rsdlc.icons import icon
+from rsdlc.icons import app_icon, icon
 from rsdlc.library import DlcEntry, Library
 from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
 from rsdlc.setlists import SetlistError, SetlistStore
@@ -1350,6 +1350,19 @@ def run() -> int:
     app.setOrganizationName("Apptic")
     QApplication.setFont(QFont(QApplication.font().family(), 10))
 
+    # Make Windows show our icon in the taskbar instead of the python.exe one.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "apptic.rsdlc.manager"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    _app_icon = app_icon()
+    app.setWindowIcon(_app_icon)
+
     settings = QSettings("Apptic", "rs-dlc-manager")
     stored_root = settings.value("rocksmith_root")
     initial: Path | None = Path(stored_root) if isinstance(stored_root, str) else None
@@ -1363,6 +1376,7 @@ def run() -> int:
 
     library = Library(root)
     window = MainWindow(library)
+    window.setWindowIcon(_app_icon)
     window.show()
     return app.exec()
 
