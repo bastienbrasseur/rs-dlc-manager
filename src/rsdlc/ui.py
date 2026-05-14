@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _COLUMNS: tuple[str, ...] = (
-    "Artiste", "Titre", "Année", "Album", "Arrangements", "Accordage", "Statut", "★",
+    "Artiste", "Titre", "Année", "Album", "Arrangements", "Accordage", "Statut", "",
 )
 _COL_FAVORITE = 7
 
@@ -502,35 +502,167 @@ class _ScanRunnable(QRunnable):
 # ---------------------------------------------------------------------------
 
 _QSS = """
+* { font-family: "Segoe UI Variable Display", "Segoe UI", "Inter", system-ui, sans-serif; }
 QMainWindow, QWidget { font-size: 10pt; }
+
+/* ---- Toolbar ---- */
 QToolBar {
-    spacing: 8px;
-    padding: 6px 10px;
-    border-bottom: 1px solid rgba(127,127,127,40);
+    spacing: 4px;
+    padding: 8px 12px;
+    background: palette(window);
+    border-bottom: 1px solid rgba(127,127,127,55);
 }
+QToolBar QToolButton {
+    padding: 6px 10px;
+    border-radius: 6px;
+    margin: 0 1px;
+}
+QToolBar QToolButton:hover { background: rgba(127,127,127,30); }
+QToolBar QToolButton:pressed { background: rgba(127,127,127,55); }
+QToolBar QToolButton:checked { background: rgba(245,197,24,38); }
+QToolBar::separator {
+    width: 1px;
+    margin: 6px 8px;
+    background: rgba(127,127,127,55);
+}
+
+/* ---- Inputs ---- */
 QLineEdit, QComboBox {
-    padding: 6px 10px;
+    padding: 7px 12px;
     min-height: 22px;
-    border-radius: 6px;
+    border-radius: 8px;
+    border: 1px solid rgba(127,127,127,55);
+    background: rgba(127,127,127,15);
+    selection-background-color: #4a90e2;
 }
+QLineEdit:focus, QComboBox:focus {
+    border-color: #4a90e2;
+    background: rgba(74,144,226,18);
+}
+QComboBox::drop-down { border: none; padding-right: 6px; }
+QComboBox QAbstractItemView {
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid rgba(127,127,127,80);
+    background: palette(window);
+    selection-background-color: rgba(74,144,226,80);
+}
+
 QPushButton {
-    padding: 6px 14px;
+    padding: 7px 16px;
     min-height: 22px;
-    border-radius: 6px;
+    border-radius: 8px;
+    border: 1px solid rgba(127,127,127,55);
+    background: rgba(127,127,127,15);
 }
+QPushButton:hover { background: rgba(127,127,127,40); }
+QPushButton:pressed { background: rgba(127,127,127,65); }
+QPushButton:checked {
+    background: rgba(74,144,226,90);
+    border-color: rgba(74,144,226,180);
+}
+QPushButton:disabled { color: rgba(127,127,127,160); }
+
+/* ---- Table ---- */
 QTableView {
-    gridline-color: rgba(127,127,127,30);
-    selection-background-color: #3a6ea5;
-    selection-color: white;
+    gridline-color: transparent;
+    border: 1px solid rgba(127,127,127,55);
+    border-radius: 10px;
+    selection-background-color: rgba(74,144,226,90);
+    selection-color: palette(text);
+    alternate-background-color: rgba(127,127,127,12);
 }
-QTableView::item { padding: 6px 8px; }
-QHeaderView::section {
+QTableView::item {
     padding: 8px 10px;
     border: none;
-    border-bottom: 1px solid rgba(127,127,127,60);
-    font-weight: 600;
 }
-QStatusBar { padding: 4px 10px; }
+QTableView::item:hover { background: rgba(127,127,127,22); }
+QTableView::item:selected { background: rgba(74,144,226,90); }
+QHeaderView::section {
+    padding: 10px 12px;
+    border: none;
+    border-bottom: 2px solid rgba(127,127,127,80);
+    background: palette(window);
+    font-weight: 600;
+    font-size: 9pt;
+    color: rgba(150,150,150,255);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+QHeaderView::section:first { border-top-left-radius: 10px; }
+QHeaderView::section:last { border-top-right-radius: 10px; }
+
+/* ---- Dock ---- */
+QDockWidget {
+    titlebar-close-icon: none;
+}
+QDockWidget::title {
+    padding: 10px 14px;
+    background: palette(window);
+    border-bottom: 1px solid rgba(127,127,127,55);
+    font-weight: 600;
+    font-size: 11pt;
+}
+QListWidget {
+    border: 1px solid rgba(127,127,127,40);
+    border-radius: 8px;
+    background: rgba(127,127,127,10);
+    padding: 4px;
+    outline: 0;
+}
+QListWidget::item {
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 1px 0;
+}
+QListWidget::item:hover { background: rgba(127,127,127,30); }
+QListWidget::item:selected {
+    background: rgba(74,144,226,90);
+    color: palette(text);
+}
+
+/* ---- Scrollbars ---- */
+QScrollBar:vertical {
+    width: 10px;
+    background: transparent;
+    margin: 4px 2px;
+}
+QScrollBar::handle:vertical {
+    background: rgba(127,127,127,80);
+    border-radius: 4px;
+    min-height: 24px;
+}
+QScrollBar::handle:vertical:hover { background: rgba(127,127,127,140); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+QScrollBar:horizontal {
+    height: 10px;
+    background: transparent;
+    margin: 2px 4px;
+}
+QScrollBar::handle:horizontal {
+    background: rgba(127,127,127,80);
+    border-radius: 4px;
+    min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover { background: rgba(127,127,127,140); }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+
+QStatusBar { padding: 4px 12px; border-top: 1px solid rgba(127,127,127,55); }
+QStatusBar QLabel { color: rgba(150,150,150,255); }
+
+QMenu {
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid rgba(127,127,127,80);
+}
+QMenu::item {
+    padding: 6px 18px;
+    border-radius: 4px;
+}
+QMenu::item:selected { background: rgba(74,144,226,90); }
+QMenu::separator { height: 1px; background: rgba(127,127,127,55); margin: 4px 8px; }
 """
 
 
@@ -549,39 +681,44 @@ class MainWindow(QMainWindow):
         # ---- central layout ----
         central = QWidget(self)
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(12, 12, 12, 12)
-        outer.setSpacing(10)
+        outer.setContentsMargins(16, 14, 16, 12)
+        outer.setSpacing(12)
 
-        # filter bar
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
+        # Filter bar with clear hierarchy: search on top, narrow filters below.
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Rechercher (artiste, titre, album)…  —  Ctrl+F")
+        self.search.setPlaceholderText("🔍   Rechercher artiste, titre ou album…  —  Ctrl+F")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.proxy.set_search)
-        bar.addWidget(self.search, 4)
+        self.search.setMinimumHeight(36)
+        f = self.search.font()
+        f.setPointSize(f.pointSize() + 1)
+        self.search.setFont(f)
+        outer.addWidget(self.search)
 
+        filt = QHBoxLayout()
+        filt.setSpacing(10)
+        filt_label = QLabel("Filtrer par")
+        filt_label.setStyleSheet("color: rgba(150,150,150,200); font-size: 9pt;")
+        filt.addWidget(filt_label)
         self.status_combo = QComboBox()
-        self.status_combo.addItem("Tous", "all")
-        self.status_combo.addItem("Actifs", "active")
-        self.status_combo.addItem("Désactivés", "disabled")
+        self.status_combo.addItem("Toutes les chansons", "all")
+        self.status_combo.addItem("Actives uniquement", "active")
+        self.status_combo.addItem("Désactivées uniquement", "disabled")
         self.status_combo.addItem("Doublons", "duplicates")
-        self.status_combo.addItem("Favoris", "favorites")
+        self.status_combo.addItem("★  Favoris", "favorites")
         self.status_combo.currentIndexChanged.connect(
             lambda _i: self.proxy.set_status(self.status_combo.currentData())
         )
-        bar.addWidget(QLabel("Statut"))
-        bar.addWidget(self.status_combo, 1)
+        filt.addWidget(self.status_combo, 2)
 
         self.tuning_combo = QComboBox()
         self.tuning_combo.addItem("Tous accordages", "")
         self.tuning_combo.currentIndexChanged.connect(
             lambda _i: self.proxy.set_tuning(self.tuning_combo.currentData())
         )
-        bar.addWidget(QLabel("Accordage"))
-        bar.addWidget(self.tuning_combo, 2)
-
-        outer.addLayout(bar)
+        filt.addWidget(self.tuning_combo, 2)
+        filt.addStretch(1)
+        outer.addLayout(filt)
 
         # table
         self.table = QTableView()
@@ -621,7 +758,8 @@ class MainWindow(QMainWindow):
         # ---- toolbar ----
         tb = QToolBar("Actions")
         tb.setMovable(False)
-        tb.setIconSize(tb.iconSize())
+        tb.setIconSize(QSize(20, 20))
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
         tb.setIconSize(QSize(18, 18))
         act_disable = QAction(icon("eye-off"), "Désactiver", self)
@@ -1035,8 +1173,12 @@ class MainWindow(QMainWindow):
                          | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
         container = QWidget()
         v = QVBoxLayout(container)
-        v.setContentsMargins(10, 10, 10, 10)
-        v.setSpacing(8)
+        v.setContentsMargins(12, 14, 12, 12)
+        v.setSpacing(10)
+        hint = QLabel("Glisse des chansons depuis la table\npour les ajouter à une setlist.")
+        hint.setStyleSheet("color: rgba(150,150,150,200); font-size: 9pt;")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
         self.setlist_list = SetlistDropList()
         self.setlist_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.setlist_list.customContextMenuRequested.connect(self._on_setlist_context_menu)
@@ -1044,19 +1186,17 @@ class MainWindow(QMainWindow):
         self.setlist_list.pathsDropped.connect(self._on_paths_dropped)
         self.setlist_list.pathsDroppedToNew.connect(self._on_paths_dropped_new)
         v.addWidget(self.setlist_list, 1)
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self.btn_new_setlist = QPushButton("+ Nouveau")
-        self.btn_new_setlist.clicked.connect(self._create_setlist)
-        row.addWidget(self.btn_new_setlist)
-        self.btn_view_setlist = QPushButton("Voir")
+        # Buttons on two rows so labels are readable in narrow docks
+        self.btn_view_setlist = QPushButton("Voir le contenu")
         self.btn_view_setlist.setCheckable(True)
         self.btn_view_setlist.toggled.connect(self._on_view_setlist_toggled)
-        row.addWidget(self.btn_view_setlist)
-        self.btn_activate_setlist = QPushButton("Activer")
+        v.addWidget(self.btn_view_setlist)
+        self.btn_activate_setlist = QPushButton("Activer cette setlist")
         self.btn_activate_setlist.clicked.connect(self._activate_or_restore)
-        row.addWidget(self.btn_activate_setlist)
-        v.addLayout(row)
+        v.addWidget(self.btn_activate_setlist)
+        self.btn_new_setlist = QPushButton("+  Nouvelle setlist")
+        self.btn_new_setlist.clicked.connect(self._create_setlist)
+        v.addWidget(self.btn_new_setlist)
         dock.setWidget(container)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
         self._setlist_dock = dock
