@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,14 +32,17 @@ from PySide6.QtWidgets import (
     QPushButton, QStatusBar, QTableView, QToolBar, QVBoxLayout, QWidget,
 )
 
-from rsdlc.albumart import build_thumbnail, cache_path_for
+from rsdlc import __version__
+from rsdlc.albumart import build_thumbnail, cache_path_for, extract_large_cover_png
 from rsdlc.duplicates import duplicate_keys, is_duplicate
 from rsdlc.favorites import Favorites
 from rsdlc.icons import app_icon, icon, padded_icon
 from rsdlc.library import DlcEntry, Library
 from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
 from rsdlc.setlists import SetlistError, SetlistStore
-from rsdlc.stats import compute_stats, format_duration
+from rsdlc.stats import format_duration
+
+APP_NAME = "Rocksmith DLC Manager"
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +51,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _COLUMNS: tuple[str, ...] = (
-    "Artiste", "Titre", "Année", "Album", "Arrangements", "Accordage", "Statut", "",
+    "Artiste", "Titre", "Album", "Année", "Arrangements", "Accordage", "Statut", "",
 )
 _COL_FAVORITE = 7
 
@@ -263,8 +267,8 @@ class DlcTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole:
             if col == 0: return e.artist
             if col == 1: return e.title
-            if col == 2: return "" if e.year is None else str(e.year)
-            if col == 3: return e.album
+            if col == 2: return e.album
+            if col == 3: return "" if e.year is None else str(e.year)
             if col == 4: return e.arrangement_label
             if col == 5: return e.tuning_label
             if col == 6: return "● actif" if e.enabled else "○ désactivé"
@@ -666,11 +670,185 @@ QMenu::separator { height: 1px; background: rgba(127,127,127,55); margin: 4px 8p
 """
 
 
+class SongDetailDialog(QDialog):
+    """Modal preview of a single song: large cover + metadata."""
+
+    _COVER_SIZE = 256
+
+    def __init__(self, entry: DlcEntry, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(entry.title or entry.path.stem)
+        self.setMinimumSize(640, 320)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 20)
+        outer.setSpacing(20)
+
+        cover = QLabel()
+        cover.setFixedSize(self._COVER_SIZE, self._COVER_SIZE)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cover.setStyleSheet(
+            "background: rgba(127,127,127,30); border-radius: 8px;"
+        )
+        pix = self._load_cover_pixmap(entry.path)
+        if pix is not None:
+            cover.setPixmap(pix)
+        else:
+            cover.setText("(pas de pochette)")
+            cover.setStyleSheet(
+                "background: rgba(127,127,127,30); border-radius: 8px;"
+                " color: rgba(150,150,150,200);"
+            )
+        outer.addWidget(cover, 0, Qt.AlignmentFlag.AlignTop)
+
+        right = QVBoxLayout()
+        right.setSpacing(6)
+
+        title = QLabel(entry.title or "(no title)")
+        tf = title.font()
+        tf.setPointSize(tf.pointSize() + 6)
+        tf.setBold(True)
+        title.setFont(tf)
+        title.setWordWrap(True)
+        right.addWidget(title)
+
+        artist = QLabel(entry.artist)
+        af = artist.font()
+        af.setPointSize(af.pointSize() + 2)
+        artist.setFont(af)
+        artist.setStyleSheet("color: rgba(150,150,150,255);")
+        artist.setWordWrap(True)
+        right.addWidget(artist)
+
+        right.addSpacing(10)
+
+        def line(left: str, value: str) -> QLabel:
+            lbl = QLabel(
+                f"<span style='color:#888'>{left}</span>"
+                f"&nbsp;&nbsp;{value}"
+            )
+            lbl.setWordWrap(True)
+            return lbl
+
+        if entry.album:
+            right.addWidget(line("Album", entry.album))
+        if entry.year is not None:
+            right.addWidget(line("Année", str(entry.year)))
+        if entry.length_seconds is not None:
+            right.addWidget(line("Durée", format_duration(entry.length_seconds)))
+        if entry.arrangement_label:
+            right.addWidget(line("Arrangements", entry.arrangement_label))
+        if entry.tuning_label:
+            right.addWidget(line("Accordage", entry.tuning_label))
+        right.addWidget(
+            line("Statut", "● actif" if entry.enabled else "○ désactivé")
+        )
+
+        right.addStretch(1)
+
+        path_label = QLabel(str(entry.path))
+        path_label.setStyleSheet(
+            "color: rgba(127,127,127,180); font-size: 8pt;"
+        )
+        path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        path_label.setWordWrap(True)
+        right.addWidget(path_label)
+
+        outer.addLayout(right, 1)
+
+    @classmethod
+    def _load_cover_pixmap(cls, psarc_path: Path) -> QPixmap | None:
+        png = extract_large_cover_png(psarc_path)
+        if png is None:
+            return None
+        pix = QPixmap()
+        if not pix.loadFromData(png):
+            return None
+        if pix.isNull():
+            return None
+        if pix.width() != cls._COVER_SIZE or pix.height() != cls._COVER_SIZE:
+            pix = pix.scaled(
+                cls._COVER_SIZE, cls._COVER_SIZE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        return pix
+
+
+class AboutDialog(QDialog):
+    """Modal 'about' dialog: app name, version, Apptic credit, legal disclaimer."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("À propos")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(10)
+
+        logo = QLabel()
+        logo.setPixmap(app_icon().pixmap(64, 64))
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(logo)
+
+        name = QLabel(APP_NAME)
+        nf = name.font()
+        nf.setPointSize(nf.pointSize() + 6)
+        nf.setBold(True)
+        name.setFont(nf)
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(name)
+
+        version = QLabel(f"Version {__version__}")
+        version.setStyleSheet("color: rgba(150,150,150,200);")
+        version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(version)
+
+        credit = QLabel(
+            'Réalisé par <a href="https://apptic.be" '
+            'style="color:#f5c518; text-decoration:none;">Apptic</a>'
+        )
+        credit.setOpenExternalLinks(True)
+        credit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(credit)
+
+        layout.addSpacing(6)
+
+        disclaimer = QLabel(
+            "Rocksmith DLC Manager n'est ni développé, ni distribué, "
+            "ni affilié à Ubisoft Entertainment. « Rocksmith » et les "
+            "marques associées appartiennent à leurs détenteurs respectifs.\n\n"
+            "Ce logiciel se contente de déplacer ou copier des fichiers "
+            "dans votre installation locale de Rocksmith — aucun contenu "
+            "n'est modifié, redistribué ou téléchargé.\n\n"
+            "Fourni « tel quel », sans garantie d'aucune sorte. Utilisation "
+            "à vos risques."
+        )
+        disclaimer.setWordWrap(True)
+        disclaimer.setStyleSheet(
+            "color: rgba(160,160,160,220); font-size: 9pt;"
+        )
+        layout.addWidget(disclaimer)
+
+        layout.addSpacing(6)
+        btn = QPushButton("OK")
+        btn.clicked.connect(self.accept)
+        btn.setDefault(True)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(btn)
+        layout.addLayout(row)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, library: Library) -> None:
         super().__init__()
         self.library = library
-        self.setWindowTitle("rs-dlc-manager — Rocksmith 2014 DLC")
+        self.setWindowTitle(APP_NAME)
+        self.setAcceptDrops(True)
         self.resize(1100, 640)
 
         self.model = DlcTableModel()
@@ -736,8 +914,8 @@ class MainWindow(QMainWindow):
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)   # Artiste
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)        # Titre
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)    # Album
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Année
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
@@ -745,8 +923,9 @@ class MainWindow(QMainWindow):
         header.setHighlightSections(False)
         self.table.setColumnWidth(_COL_FAVORITE, 48)
         self.table.clicked.connect(self._on_table_clicked)
+        self.table.doubleClicked.connect(self._on_table_double_clicked)
         self.table.setColumnWidth(0, 220)
-        self.table.setColumnWidth(3, 200)
+        self.table.setColumnWidth(2, 200)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         self.table.setDragEnabled(True)
@@ -794,13 +973,13 @@ class MainWindow(QMainWindow):
         act_setlists.toggled.connect(self._toggle_setlist_dock)
         tb.addAction(act_setlists)
         self._act_setlists = act_setlists
-        act_stats = QAction(icon("bar-chart-3"), "Statistiques", self)
-        act_stats.triggered.connect(self.show_stats)
-        tb.addAction(act_stats)
         tb.addSeparator()
         act_pick = QAction(icon("folder-open"), "Changer de dossier…", self)
         act_pick.triggered.connect(self.pick_folder)
         tb.addAction(act_pick)
+        act_about = QAction(icon("info"), "À propos", self)
+        act_about.triggered.connect(self.show_about)
+        tb.addAction(act_about)
         self._act_undo = act_undo
 
         # Ctrl+F → search focus
@@ -1145,16 +1324,12 @@ class MainWindow(QMainWindow):
     # ---- folder picker ----
     def pick_folder(self) -> None:
         start = str(self.library.rocksmith_root)
-        chosen = QFileDialog.getExistingDirectory(self, "Dossier Rocksmith2014", start)
+        chosen = QFileDialog.getExistingDirectory(self, _PICKER_CAPTION, start)
         if not chosen:
             return
-        new_root = Path(chosen)
-        if not (new_root / "dlc").is_dir() and not looks_like_rocksmith_root(new_root):
-            if QMessageBox.question(
-                self, "Dossier inhabituel",
-                f"{new_root} ne contient pas de sous-dossier dlc/. Continuer quand même ?",
-            ) != QMessageBox.StandardButton.Yes:
-                return
+        new_root = _resolve_picked_root(Path(chosen), self)
+        if new_root is None:
+            return
         self.library = Library(new_root)
         self.settings.setValue("rocksmith_root", str(new_root))
         self.start_scan(force=False)
@@ -1198,7 +1373,7 @@ class MainWindow(QMainWindow):
         self.btn_new_setlist.clicked.connect(self._create_setlist)
         v.addWidget(self.btn_new_setlist)
         dock.setWidget(container)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self._setlist_dock = dock
         dock.visibilityChanged.connect(self._on_setlist_dock_visibility)
         self._refresh_setlist_list()
@@ -1433,53 +1608,94 @@ class MainWindow(QMainWindow):
         if seen:
             self.proxy.invalidateFilter()
 
-    def show_stats(self) -> None:
-        entries = self.model.all_entries()
-        s = compute_stats(entries)
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Statistiques")
-        dlg.resize(420, 520)
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
-
-        def section(title: str) -> QLabel:
-            lbl = QLabel(title)
-            f = lbl.font()
-            f.setBold(True)
-            f.setPointSize(f.pointSize() + 1)
-            lbl.setFont(f)
-            return lbl
-
-        def line(left: str, right: str) -> QLabel:
-            return QLabel(f"<span style='color:#888'>{left}</span>  &nbsp;&nbsp;{right}")
-
-        layout.addWidget(section("Vue d'ensemble"))
-        layout.addWidget(line("Fichiers", f"{s.total_files}"))
-        layout.addWidget(line("Actifs", f"{s.active_files}"))
-        layout.addWidget(line("Désactivés", f"{s.disabled_files}"))
-        layout.addWidget(line("Chansons", f"{s.total_songs}"))
-        layout.addWidget(line("Durée totale", format_duration(s.total_seconds)))
-        if s.songs_without_metadata:
-            layout.addWidget(line("Sans métadonnées", str(s.songs_without_metadata)))
-
-        if s.by_tuning:
-            layout.addWidget(section("Accordages"))
-            for name, n in s.by_tuning[:8]:
-                layout.addWidget(line(name, f"{n}"))
-
-        if s.by_decade:
-            layout.addWidget(section("Par décennie"))
-            for decade, n in s.by_decade:
-                layout.addWidget(line(f"{decade}s", f"{n}"))
-
-        if s.top_artists:
-            layout.addWidget(section("Top artistes"))
-            for name, n in s.top_artists:
-                layout.addWidget(line(name, f"{n}"))
-
-        layout.addStretch(1)
+    def _on_table_double_clicked(self, proxy_idx: QModelIndex) -> None:
+        if not proxy_idx.isValid() or proxy_idx.column() == _COL_FAVORITE:
+            return
+        src_idx = self.proxy.mapToSource(proxy_idx)
+        e = self.model.entry(src_idx.row())
+        dlg = SongDetailDialog(e, self)
         dlg.exec()
+
+    def show_about(self) -> None:
+        AboutDialog(self).exec()
+
+    # ---- drag & drop import ----
+
+    @staticmethod
+    def _collect_psarcs_from_urls(urls: list[Any]) -> list[Path]:
+        """Filter dropped URLs down to local ``*_p.psarc`` paths (PC only)."""
+        out: list[Path] = []
+        for u in urls:
+            if not u.isLocalFile():
+                continue
+            p = Path(u.toLocalFile())
+            if p.is_file() and p.name.lower().endswith("_p.psarc"):
+                out.append(p)
+        return out
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        md = event.mimeData()
+        if md.hasUrls() and self._collect_psarcs_from_urls(list(md.urls())):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        md = event.mimeData()
+        if md.hasUrls() and self._collect_psarcs_from_urls(list(md.urls())):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            super().dropEvent(event)
+            return
+        psarcs = self._collect_psarcs_from_urls(list(md.urls()))
+        if not psarcs:
+            super().dropEvent(event)
+            return
+        self._import_psarcs(psarcs)
+        event.acceptProposedAction()
+
+    def _import_psarcs(self, sources: list[Path]) -> None:
+        """Copy each .psarc into the active ``dlc/`` folder, skipping conflicts."""
+        dst_root = self.library.dlc_dir
+        try:
+            dst_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.status.showMessage(
+                f"Impossible de créer {dst_root}: {exc}", 6000,
+            )
+            return
+        added = 0
+        skipped = 0
+        errors = 0
+        for src in sources:
+            dst = dst_root / src.name
+            if dst.exists():
+                skipped += 1
+                logger.info("import: skip (already exists) %s", dst)
+                continue
+            try:
+                shutil.copy2(src, dst)
+                added += 1
+            except OSError as exc:
+                errors += 1
+                logger.warning("import: copy failed %s -> %s: %s", src, dst, exc)
+        parts: list[str] = []
+        if added:
+            parts.append(f"{added} ajouté(s)")
+        if skipped:
+            parts.append(f"{skipped} ignoré(s) (déjà présent)")
+        if errors:
+            parts.append(f"{errors} erreur(s)")
+        if not parts:
+            parts.append("Aucun fichier valide")
+        self.status.showMessage("Import : " + ", ".join(parts), 5000)
+        if added:
+            self.start_scan(force=False)
 
     # ---- persistence ----
     def closeEvent(self, event: Any) -> None:
@@ -1529,18 +1745,70 @@ def _apply_theme(app: QApplication) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+_PICKER_CAPTION = "Sélectionne le dossier Rocksmith2014 (parent de dlc/)"
+
+
+def _resolve_picked_root(picked: Path, parent_widget: QWidget | None) -> Path | None:
+    """Sanity-check a user-picked folder.
+
+    - If the user picked the ``dlc/`` subfolder by mistake, propose its parent.
+    - If the folder neither contains ``dlc/`` nor looks like a Rocksmith root,
+      confirm before continuing.
+
+    Returns the folder to use, or ``None`` to abort.
+    """
+    if picked.name.lower() == "dlc" and picked.is_dir():
+        parent = picked.parent
+        reply = QMessageBox.question(
+            parent_widget,
+            "Mauvais dossier",
+            f"Tu as sélectionné le sous-dossier <b>dlc/</b>.<br><br>"
+            f"Le programme a besoin du dossier d'installation Rocksmith2014 "
+            f"(le <i>parent</i> de dlc/), pas dlc/ lui-même.<br><br>"
+            f"Utiliser :<br><code>{parent}</code> ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return None
+        return parent
+
+    if (picked / "dlc").is_dir() or looks_like_rocksmith_root(picked):
+        return picked
+
+    reply = QMessageBox.question(
+        parent_widget,
+        "Dossier inhabituel",
+        f"{picked}<br><br>"
+        f"ne contient pas de sous-dossier <b>dlc/</b> et ne ressemble pas à "
+        f"une installation Rocksmith2014.<br><br>Continuer quand même ?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+        return None
+    return picked
+
+
 def _choose_root(initial: Path | None) -> Path | None:
     if initial and (initial / "dlc").is_dir():
         return initial
     if initial and looks_like_rocksmith_root(initial):
         return initial
+    QMessageBox.information(
+        None,
+        "Dossier d'installation Rocksmith",
+        "Sélectionne le dossier d'installation <b>Rocksmith2014</b>.<br><br>"
+        "⚠ Important : c'est le dossier qui <b>contient</b> le sous-dossier "
+        "<code>dlc/</code>, pas le sous-dossier <code>dlc/</code> lui-même.<br><br>"
+        "Typiquement :<br>"
+        "<code>C:\\Program Files (x86)\\Steam\\steamapps\\common\\Rocksmith2014</code>",
+    )
     chosen = QFileDialog.getExistingDirectory(
-        None, "Sélectionne le dossier Rocksmith2014",
+        None, _PICKER_CAPTION,
         str(initial) if initial else "",
     )
     if not chosen:
         return None
-    return Path(chosen)
+    return _resolve_picked_root(Path(chosen), None)
 
 
 def run() -> int:
@@ -1559,7 +1827,7 @@ def run() -> int:
 
     app = QApplication(sys.argv)
     _apply_theme(app)
-    app.setApplicationName("rs-dlc-manager")
+    app.setApplicationName(APP_NAME)
     app.setOrganizationName("Apptic")
     QApplication.setFont(QFont(QApplication.font().family(), 10))
 

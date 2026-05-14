@@ -43,6 +43,52 @@ def _smallest_dds(names: tuple[str, ...]) -> str | None:
     return sorted(candidates, key=key)[0]
 
 
+def _largest_dds(names: tuple[str, ...]) -> str | None:
+    """Pick the largest album_art DDS available (prefer 256, then 128, then 64)."""
+    candidates = [n for n in names if "album_art" in n and n.endswith(".dds")]
+    if not candidates:
+        return None
+    def key(name: str) -> tuple[int, str]:
+        for suffix in ("_256.dds", "_128.dds", "_64.dds"):
+            if name.endswith(suffix):
+                return (-int(suffix.split("_")[1].split(".")[0]), name)
+        return (0, name)
+    return sorted(candidates, key=key)[0]
+
+
+def extract_large_cover_png(psarc_path: Path) -> bytes | None:
+    """Read the largest album_art DDS from a PSARC and return PNG bytes (no resize).
+
+    Used for the song-detail dialog. Returns None if no art or cannot decode.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("Pillow not installed; large cover disabled")
+        return None
+    try:
+        with PsarcArchive.open(psarc_path) as a:
+            name = _largest_dds(a.names())
+            if name is None:
+                return None
+            dds = a.read(name)
+    except (PsarcError, OSError) as exc:
+        logger.debug("could not read %s: %s", psarc_path, exc)
+        return None
+    try:
+        loaded = Image.open(BytesIO(dds))
+        loaded.load()
+        img: Image.Image = loaded
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        out = BytesIO()
+        img.save(out, format="PNG", optimize=False)
+        return out.getvalue()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("could not decode DDS in %s: %s", psarc_path, exc)
+        return None
+
+
 def extract_thumbnail_png(psarc_path: Path, target_size: int = 48) -> bytes | None:
     """Read the album art from a PSARC and return PNG bytes at ``target_size``.
 
@@ -104,5 +150,6 @@ __all__ = [
     "cache_filename",
     "cache_path_for",
     "extract_thumbnail_png",
+    "extract_large_cover_png",
     "build_thumbnail",
 ]
