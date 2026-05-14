@@ -299,6 +299,7 @@ class DlcFilterProxy(QSortFilterProxyModel):
         self._status = "all"      # all | active | disabled | duplicates | favorites
         self._tuning = ""         # "" = all, otherwise must match tuning_label
         self._dup_set: set[tuple[str, str]] | None = None
+        self._setlist_paths: set[str] | None = None   # None = no setlist filter
 
     def setSourceModel(self, source_model: QAbstractItemModel) -> None:
         old = self.sourceModel()
@@ -339,6 +340,11 @@ class DlcFilterProxy(QSortFilterProxyModel):
         self._tuning = tuning
         self.invalidateFilter()
 
+    def set_setlist_paths(self, paths: set[str] | None) -> None:
+        """Restrict the view to a setlist (None to clear)."""
+        self._setlist_paths = paths
+        self.invalidateFilter()
+
     def filterAcceptsRow(self, source_row: int,
                          source_parent: QModelIndex | QPersistentModelIndex) -> bool:
         model = self.sourceModel()
@@ -358,6 +364,13 @@ class DlcFilterProxy(QSortFilterProxyModel):
                 return False
         if self._tuning and e.tuning_label != self._tuning:
             return False
+        if self._setlist_paths is not None:
+            try:
+                key = str(e.path.resolve())
+            except OSError:
+                key = str(e.path)
+            if key not in self._setlist_paths:
+                return False
         if self._search:
             hay = f"{e.artist} {e.title} {e.album}".casefold()
             if self._search not in hay:
@@ -637,6 +650,12 @@ class MainWindow(QMainWindow):
         act_undo.triggered.connect(self.undo_last)
         tb.addAction(act_undo)
         tb.addSeparator()
+        act_setlists = QAction(icon("list"), "Panneau Setlists", self)
+        act_setlists.setCheckable(True)
+        act_setlists.setChecked(True)
+        act_setlists.toggled.connect(self._toggle_setlist_dock)
+        tb.addAction(act_setlists)
+        self._act_setlists = act_setlists
         act_stats = QAction(icon("bar-chart-3"), "Statistiques", self)
         act_stats.triggered.connect(self.show_stats)
         tb.addAction(act_stats)
@@ -1030,13 +1049,25 @@ class MainWindow(QMainWindow):
         self.btn_new_setlist = QPushButton("+ Nouveau")
         self.btn_new_setlist.clicked.connect(self._create_setlist)
         row.addWidget(self.btn_new_setlist)
+        self.btn_view_setlist = QPushButton("Voir")
+        self.btn_view_setlist.setCheckable(True)
+        self.btn_view_setlist.toggled.connect(self._on_view_setlist_toggled)
+        row.addWidget(self.btn_view_setlist)
         self.btn_activate_setlist = QPushButton("Activer")
         self.btn_activate_setlist.clicked.connect(self._activate_or_restore)
         row.addWidget(self.btn_activate_setlist)
         v.addLayout(row)
         dock.setWidget(container)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self._setlist_dock = dock
+        dock.visibilityChanged.connect(self._on_setlist_dock_visibility)
         self._refresh_setlist_list()
+
+    def _on_setlist_dock_visibility(self, visible: bool) -> None:
+        if hasattr(self, "_act_setlists"):
+            self._act_setlists.blockSignals(True)
+            self._act_setlists.setChecked(visible)
+            self._act_setlists.blockSignals(False)
 
     def _build_setlist_banner(self, outer: QVBoxLayout) -> None:
         self.setlist_banner = QFrame()
@@ -1083,14 +1114,49 @@ class MainWindow(QMainWindow):
         if name is None:
             self.btn_activate_setlist.setEnabled(False)
             self.btn_activate_setlist.setText("Activer")
+            self.btn_view_setlist.setEnabled(False)
+            self.btn_view_setlist.blockSignals(True)
+            self.btn_view_setlist.setChecked(False)
+            self.btn_view_setlist.blockSignals(False)
             return
         self.btn_activate_setlist.setEnabled(True)
+        self.btn_view_setlist.setEnabled(True)
         if name == active:
             self.btn_activate_setlist.setText("Restaurer")
         elif active is not None:
             self.btn_activate_setlist.setText("Basculer vers celle-ci")
         else:
             self.btn_activate_setlist.setText("Activer cette setlist")
+        # If we change selection while another setlist was being viewed,
+        # turn the view off — it pointed at a different list.
+        if self.btn_view_setlist.isChecked():
+            self.btn_view_setlist.blockSignals(True)
+            self.btn_view_setlist.setChecked(False)
+            self.btn_view_setlist.blockSignals(False)
+            self.proxy.set_setlist_paths(None)
+            self._update_status_label()
+
+    def _on_view_setlist_toggled(self, checked: bool) -> None:
+        if not checked:
+            self.proxy.set_setlist_paths(None)
+            self.btn_view_setlist.setText("Voir")
+        else:
+            name = self._selected_setlist_name()
+            if name is None or name not in self._setlists.setlists:
+                self.btn_view_setlist.blockSignals(True)
+                self.btn_view_setlist.setChecked(False)
+                self.btn_view_setlist.blockSignals(False)
+                return
+            paths = set(self._setlists.setlists[name].paths)
+            self.proxy.set_setlist_paths(paths)
+            self.btn_view_setlist.setText("✕ Voir")
+            self.status.showMessage(
+                f"Filtre : {len(paths)} chanson(s) de la setlist '{name}'", 3000,
+            )
+        self._update_status_label()
+
+    def _toggle_setlist_dock(self, checked: bool) -> None:
+        self._setlist_dock.setVisible(checked)
 
     def _refresh_setlist_banner(self) -> None:
         name = self._setlists.active_name
