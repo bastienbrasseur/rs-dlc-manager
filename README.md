@@ -1,4 +1,4 @@
-# rs-dlc-manager
+# Rocksmith DLC Manager
 
 Petit gestionnaire pour les DLC Rocksmith 2014 (PC, Steam).
 
