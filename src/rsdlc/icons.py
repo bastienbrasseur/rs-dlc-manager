@@ -129,6 +129,35 @@ def _palette_color() -> QColor:
     return QColor(app.palette().windowText().color())
 
 
+def padded_icon(name: str, outer_size: int, inner_size: int,
+                color: QColor | None = None) -> QIcon:
+    """Render a Lucide icon at ``inner_size`` centered inside a transparent
+    ``outer_size`` × ``outer_size`` pixmap.
+
+    Useful when the icon will land in a slot whose iconSize is fixed (e.g. a
+    table column that also displays bigger thumbnails) but the icon itself
+    should look smaller.
+    """
+    svg = _SVG.get(name)
+    if svg is None:
+        return QIcon()
+    fg = color or _palette_color()
+    svg_data = svg.replace("currentColor", fg.name())
+    renderer = QSvgRenderer(QByteArray(svg_data.encode("utf-8")))
+    scale = 4
+    pix = QPixmap(outer_size * scale, outer_size * scale)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    inner_px = inner_size * scale
+    offset = (outer_size * scale - inner_px) // 2
+    renderer.render(painter, QRectF(float(offset), float(offset),
+                                    float(inner_px), float(inner_px)))
+    painter.end()
+    return QIcon(pix)
+
+
 def icon(name: str, size: int = 20, color: QColor | None = None) -> QIcon:
     """Return a :class:`QIcon` for one of the bundled Lucide icons.
 
@@ -155,4 +184,4 @@ def icon(name: str, size: int = 20, color: QColor | None = None) -> QIcon:
     return QIcon(pix)
 
 
-__all__ = ["icon"]
+__all__ = ["icon", "padded_icon", "app_icon"]

@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 from rsdlc.albumart import build_thumbnail, cache_path_for
 from rsdlc.duplicates import duplicate_keys, is_duplicate
 from rsdlc.favorites import Favorites
-from rsdlc.icons import app_icon, icon
+from rsdlc.icons import app_icon, icon, padded_icon
 from rsdlc.library import DlcEntry, Library
 from rsdlc.paths import autodetect_rocksmith_root, looks_like_rocksmith_root
 from rsdlc.setlists import SetlistError, SetlistStore
@@ -70,9 +70,16 @@ class DlcTableModel(QAbstractTableModel):
 
     def set_favorites(self, favorites: Favorites) -> None:
         self._favorites = favorites
-        # Lazy-construct the icons the first time we have a QApplication.
-        self._star_icon = icon("star", size=18)
-        self._star_fill_icon = icon("star-fill", size=18, color=QColor("#f5c518"))
+        # The table iconSize is _THUMB_SIZE (40px) to fit album thumbnails on
+        # column 0. Pad the star into a transparent 40×40 frame so it appears
+        # at a sane size (22px) in the favorite column.
+        self._star_icon = padded_icon(
+            "star", outer_size=_THUMB_SIZE, inner_size=22,
+        )
+        self._star_fill_icon = padded_icon(
+            "star-fill", outer_size=_THUMB_SIZE, inner_size=22,
+            color=QColor("#f5c518"),
+        )
 
     def is_favorite(self, p: Path) -> bool:
         return self._favorites is not None and self._favorites.contains(p)
@@ -586,7 +593,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(_COL_FAVORITE, QHeaderView.ResizeMode.Fixed)
         header.setHighlightSections(False)
-        self.table.setColumnWidth(_COL_FAVORITE, 40)
+        self.table.setColumnWidth(_COL_FAVORITE, 48)
         self.table.clicked.connect(self._on_table_clicked)
         self.table.setColumnWidth(0, 220)
         self.table.setColumnWidth(3, 200)
