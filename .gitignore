@@ -20,5 +20,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code (instructions locales, hors du repo)
+.claude/
+CLAUDE.md
+
 # User data
 ~/.rs-dlc-manager/
