@@ -759,7 +759,7 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Actions")
         tb.setMovable(False)
         tb.setIconSize(QSize(20, 20))
-        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.addToolBar(tb)
         tb.setIconSize(QSize(18, 18))
         act_disable = QAction(icon("eye-off"), "Désactiver", self)
